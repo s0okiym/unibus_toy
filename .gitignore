@@ -1,0 +1,23 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+/bin/
+/dist/
+/build/
+*.exe
+*.out
+
+# Go
+/vendor/
+*.test
+coverage.out
+
+# Logs
+*.log
