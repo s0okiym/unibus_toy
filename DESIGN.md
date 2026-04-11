@@ -121,8 +121,9 @@ flowchart TB
 | 4 | 1 | Version，首版 `1` |
 | 5 | 1 | Type（上表） |
 | 6 | 2 | Flags（ACK 请求、分片首/中/尾、是否 imm 等） |
-| 8 | 4 | SrcNodeID |
-| 12 | 4 | DstNodeID |
+| 8 | 2 | SrcNodeID（`uint16`，与 FR-ADDR-1 NodeID:16 对齐） |
+| 10 | 2 | DstNodeID（`uint16`） |
+| 12 | 4 | Reserved（首版填 0；高 8 bit 预留源路由扩展偏移，对应 FR-CTRL-5 预留点） |
 | 16 | 8 | **StreamSeq**：本 `(src,dst)` 会话单调递增序号（见 §5） |
 | 24 | 4 | PayloadLen |
 | 28 | 4 | HeaderCRC（可选；首版可 0 表示禁用） |
@@ -182,8 +183,8 @@ flowchart TB
 ## 6. 流控（FR-FLOW）
 
 - **信用粒度**：**WR 个数**（需求已明确）。
-- **初始窗口**：配置 `initial_credits`（如 64）；接收端每向应用交付 1 个 RX 完成或消费 1 个 `post_recv` 槽，本地 `credits++` 并通过 `CREDIT` 帧或嵌入 ACK 通告。
-- **背压**：发送端 `credits==0` 时不得从 JFS 取新 WR（或取后阻塞在 transport 队列，**禁止**无限堆内存）；与 **FR-JETTY-3** 一致：JFC 满时同样阻止新发送。
+- **初始窗口**：配置 `initial_credits`（如 64）；接收端在应用 **poll/取走 CQE** 时（即 CQE 被消费，与 FR-FLOW-1「消费一个 CQE 返还 1 credit」一致），本地 `credits_to_grant++`，并通过 `CREDIT` 帧或嵌入 ACK 通告发送端；**注意**：credit 返还时机是 CQE 被取走，而非内部交付到 JFC——两者存在时间差，应用积压 CQE 不取则自然形成背压。
+- **背压（FR-FLOW-2）**：接收端 JFR 或 JFC 槽紧张时，**停止返还** credit（`credits_to_grant` 保持 0，不发负向 CREDIT 帧）；发送端未收到新 grant，`credits` 归零后停止取新 WR（**禁止**无限堆内存）；与 **FR-JETTY-3** 一致：JFC 高水位满时同样阻止新发送。
 - **AIMD（FR-FLOW-3）**：在检测到持续 `NO_CREDIT` 或 RTT 上升时减小窗口；恢复时线性增（具体参数放配置文件）。
 
 ---
@@ -240,6 +241,14 @@ flowchart TB
 
 - **不**在协议层提供 fence；若 demo 需要，用 `write_with_imm` 或应用层协议序号。
 
+### 8.6 MR 注销时 inflight 处理（FR-ADDR-5）
+
+- `ub_mr_deregister(handle)` 立即将 MR 状态置为 `REVOKING`，同时触发控制面 `MR_REVOKE` 广播。
+- **此后到达的** `READ_REQ` / `WRITE` / `ATOMIC_*` 帧若引用该 MR 的 UB 区间：接收端返回错误响应帧（`status = UB_ERR_ADDR_INVALID`），**不执行**任何写副作用。
+- **已通过权限检查、正在执行的**写操作：允许完成（内存仍在范围内），避免状态机复杂化；toy 级别可接受此窗口。
+- 本地 WR 若尚未发出且 MR 已 `REVOKING`：直接在 JFC 生成 `UB_ERR_ADDR_INVALID` CQE，不发送网络帧。
+- `MR_REVOKE` 广播 fire-and-forget，不等 peer ACK；peer 在本地 MR 元数据缓存中标记该区间无效即可。
+
 ---
 
 ## 9. 错误码映射（FR-ERR）
@@ -264,7 +273,10 @@ node_id: 42
 role: member            # hub | member（星形控制面时）
 control:
   listen: "0.0.0.0:7900"
-  peers: ["10.0.0.1:7900", "10.0.0.2:7900"]
+  bootstrap: static           # static | seed
+  peers: ["10.0.0.1:7900", "10.0.0.2:7900"]  # static 模式：列出所有节点地址
+  # seed_addrs: ["10.0.0.1:7900"]             # seed 模式：报到地址（与 peers 二选一）
+  hub_node_id: 0              # 星形拓扑时指定 hub 的 NodeID；0 = 全连接模式
 data:
   listen: "0.0.0.0:7901"
   fabric: udp             # udp | tcp | uds
@@ -300,6 +312,8 @@ type Fabric interface {
 
 type Session interface {
     Send(ctx context.Context, pkt []byte) error
+    // Recv 返回的 []byte 归 Session 所有；调用方必须在下次 Recv 调用前完成读取或自行拷贝。
+    // transport 层应通过 sync.Pool 复用 buffer 以避免频繁分配。
     Recv(ctx context.Context) ([]byte, error)
     Close() error
 }
