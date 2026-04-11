@@ -6,7 +6,7 @@
 | **文档状态** | Draft（待评审） |
 | **最后更新** | 2026-04-11 |
 
-本文在需求文档已拍板的默认决策（**Rust + tokio**、YAML、UDP 默认、HTTP `/metrics`、128 bit UB 地址等）基础上，给出**可实现**的模块划分、协议头、状态机与关键算法约定；未写死的字段保留「实现可调整但须回归需求 FR」的弹性。
+本文在需求文档已拍板的默认决策（**Rust + tokio**、YAML、UDP 默认、HTTP `/metrics`、128 bit UB 地址、**首版含 Device 抽象与 NPU 纯软件模拟**等）基础上，给出**可实现**的模块划分、协议头、状态机与关键算法约定；未写死的字段保留「实现可调整但须回归需求 FR」的弹性。
 
 ---
 
@@ -27,7 +27,8 @@
 |---|---|---|
 | **Verb / 事务层** | `ub-core::verbs`（或并入 `ub-core::jetty`） | 将 `ub_read` / `ub_write` / `ub_send` 等转为 WR，投递 JFS；从 JFC 交付 CQE；同步 API 在此层对 async 版本封装 `block_on` |
 | **Jetty 资源层** | `ub-core::jetty` | JFS/JFR/JFC 队列、深度、背压；`jetty_id` 分配；`flushed` CQE |
-| **MR / 地址** | `ub-core::{mr, addr}` | 本地 MR 表、UB→VA 翻译；对齐检查；权限检查 |
+| **MR / 地址** | `ub-core::{mr, addr}` | 本地 MR 表、UB→(device, offset) 翻译；对齐检查；权限检查；按 device 分派读写 |
+| **Device 后端** | `ub-core::device`（内含 `memory` / `npu` 两个子模块） | `Device` trait：read / write / atomic 原语；CPU 直接操作 `&mut [u8]`；NPU 为纯软件模拟字节数组（FR-DEV-2） |
 | **可靠传输** | `ub-transport` | 每对 `(src_node, dst_node)` 的序号、ACK/SACK、重传定时器、去重窗口 |
 | **分片与重组** | `ub-transport::fragment`（子模块） | 大于 PMTU 的 payload 切分；重组超时与内存上限 |
 | **网络成帧** | `ub-wire` | 定长头 + payload + 可选扩展头；版本、魔数 |
@@ -102,7 +103,7 @@ flowchart TB
 |---|---|---|
 | PodID | 16 | 配置 `pod_id`，默认 1 |
 | NodeID | 16 | 控制面分配，静态配置或 seed 分配 |
-| DeviceID | 16 | 首版仅 `MEMORY` device，默认 0 |
+| DeviceID | 16 | 节点内 device 身份（FR-DEV-4）：`0` = 默认 CPU memory；`1..` = NPU 或后续扩展设备；同一节点可同时存在 CPU 与 NPU MR |
 | Offset | 64 | **字节**偏移，相对 MR 起始 |
 | Reserved | 16 | 填 0；扩展 Tenant/VC |
 
@@ -114,6 +115,39 @@ flowchart TB
 
 - **JettyID**：节点内 `uint32` 自增分配器；**不得**跨节点唯一（跨节点需 `(NodeID, JettyID)`）。
 - **对端寻址**：数据面头携带 `dst_node_id` + `dst_jetty_id`；源携带 `src_jetty_id`。
+
+### 3.3 Device 抽象与 NPU 模拟（FR-DEV）
+
+首版要求一个节点能同时注册 **CPU 内存 MR** 与 **NPU 显存 MR**，且远端访问完全透明（FR-DEV-3/5）。为此在 `ub-core::device` 中定义：
+
+```rust
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeviceKind { Memory, Npu }
+
+pub trait Device: Send + Sync {
+    fn kind(&self) -> DeviceKind;
+    fn device_id(&self) -> u16;           // 写入 UB 地址 DeviceID 字段
+    fn capacity(&self) -> u64;
+
+    /// buf 填充目标，offset 为 device 基址相对偏移
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), UbError>;
+    fn write(&self, offset: u64, buf: &[u8]) -> Result<(), UbError>;
+
+    /// 8 B 对齐原语，底层用 AtomicU64 实现；NPU 也复用该实现
+    fn atomic_cas(&self, offset: u64, expect: u64, new: u64) -> Result<u64, UbError>;
+    fn atomic_faa(&self, offset: u64, add: u64) -> Result<u64, UbError>;
+}
+```
+
+- **`MemoryDevice`**：backing 是节点进程自身堆内存。`ub_mr_register` 传入的 `&mut [u8]` / `Box<[u8]>` 被 device 内部保管；`read/write` 直接 `copy_from_slice`；atomic 用 `AtomicU64::compare_exchange` / `fetch_add`（`Ordering::AcqRel`）。
+- **`NpuDevice`（纯软件模拟）**：
+  - 启动时 `ub_npu_open(size)` 分配一整块 `Box<[AtomicU8]>` 或 `Vec<u8>` + `UnsafeCell` 包装（前者便于 atomic 原语，后者省内存——首版用 `Vec<u8>` + `parking_lot::RwLock` 足够 toy 级）。
+  - **不**引入任何 CUDA / ROCm / Vulkan 依赖，不模拟 HBM 延迟 / 带宽（FR-DEV-7）。
+  - `ub_npu_alloc(handle, len, align)` 用简单的 bump allocator 在 device 内部维护游标；回收在首版为 no-op（注销 MR 即归还，但游标不复用——toy 阶段接受碎片）。
+  - `atomic_*` 对 NPU 显存的语义与 CPU 内存一致，因为 backing 本质仍是进程内存；这个简化让"跨 device 的 UB 地址全用同一套 verbs"在实现上天然成立。
+- **MR → Device 路由**：本地 MR 表以 `mr_handle: u32` 为主键，条目包含 `Arc<dyn Device>` + `offset_base` + `len` + `perms`。数据面收到 DATA 帧后（见 §4.2 `MRHandle`），`mr_table.lookup(handle)` O(1) 拿到 `Arc<dyn Device>`，再 `device.read/write(offset_base + frame.ub_addr.offset - mr.base_offset, ...)`。这条路径对 CPU / NPU **无分支**，满足 FR-DEV-3 的"远端透明"。
+- **DeviceID 分配**：每个节点启动时：`MemoryDevice` 固定 `device_id = 0`；每 `ub_npu_open` 调用成功分配一个 `≥ 1` 的自增 `device_id`（首版通常只开 1 个 NPU，即 `device_id = 1`）。`device_id` 仅在节点内部有意义，不需要跨节点唯一，因为 UB 地址已经携带 NodeID 限定。
+- **FR-DEV-5 API**：`ub_npu_open` / `ub_npu_alloc` 放在 `ub-core::device::npu` 模块，返回给应用的是 `NpuHandle` + `(offset, len)` 元组；应用把 `(npu_handle, offset)` 喂给 `ub_mr_register`，MR 层内部取出 `Arc<NpuDevice>` 存到 MR 条目中。
 
 ---
 
@@ -251,7 +285,7 @@ ACK 帧通用头的 `PayloadLen` = 16（无 SACK）或 48（含 SACK）。
 |---|---|
 | `HELLO` | NodeID, 数据面地址, 版本, `local_epoch`（§5.1）, `initial_credits`（§6） |
 | `MEMBER_UP` / `MEMBER_DOWN` | 节点状态 |
-| `MR_PUBLISH` / `MR_REVOKE` | `owner_node`, `mr_handle`（owner 本地 uint32 句柄，供 DATA 扩展头 O(1) 查表）, UB 区间起始/长度, `perms` |
+| `MR_PUBLISH` / `MR_REVOKE` | `owner_node`, `mr_handle`（owner 本地 uint32 句柄，供 DATA 扩展头 O(1) 查表）, UB 区间起始/长度, `perms`, `device_kind`（`u8`: 0=MEMORY, 1=NPU, 供 `unibusctl mr list` 展示与远端可观测性，不参与路由逻辑） |
 | `HEARTBEAT` / `HEARTBEAT_ACK` | 时间戳；走控制面 TCP 共用连接，**不**独立线程（FR-CTRL-3） |
 
 **FR-CTRL-4**：`last_seen` + 超时（默认 1s * 3）将节点标为 `DOWN`，广播 `MEMBER_DOWN`，并通知 transport 失效该 peer 会话。
@@ -351,6 +385,11 @@ data:
   mtu: 1400
 mr:
   deregister_timeout_ms: 500    # §8.6：ub_mr_deregister 等待 inflight 归零的上限
+device:
+  npu:
+    enabled: true               # FR-DEV-2：首版默认启用一个模拟 NPU
+    mem_size_mib: 256           # 模拟显存大小，启动时一次性分配
+    # 未来如需多 NPU，可改成 list：[{mem_size_mib: 256}, {mem_size_mib: 512}]
 transport:
   rto_ms: 200
   max_retries: 8
@@ -427,6 +466,7 @@ pub trait Session: Send {
 | cas 更新 | `ub_atomic_cas` |
 | 通知副本 | `ub_send` 或 `write_with_imm` |
 | 故障 | 节点 DOWN 后 client 收到 `UB_ERR_LINK_DOWN`，CLI 切换 |
+| NPU MR（可选 demo 变体） | owner 把 value 区注册在 NPU MR 上（`ub_npu_open` + `ub_npu_alloc` + `ub_mr_register`），client 完全不感知——同一组 `ub_read/ub_write/ub_atomic_cas` 正确工作，验证 FR-DEV-3 的远端透明 |
 
 ---
 
@@ -448,7 +488,7 @@ pub trait Session: Send {
 | 里程碑 | 主要代码落点 |
 |---|---|
 | M1 | `ub-control`, `unibusd`, `unibusctl`（`node` 子命令） |
-| M2 | `ub-core::{mr, addr}`, `ub-transport` + verbs read/write/atomic |
+| M2 | `ub-core::{mr, addr, device}`（含 `device::memory` 与 `device::npu` 模拟后端，FR-DEV）, `ub-transport` + verbs read/write/atomic；端到端测试至少覆盖"CPU MR 与 NPU MR 在同一 demo 内共存" |
 | M3 | `ub-core::jetty`, send/recv/imm |
 | M4 | 完整 FR-REL + FR-FLOW + FR-FAIL |
 | M5 | `ub-obs`, `criterion` bench, KV demo |
@@ -464,6 +504,7 @@ pub trait Session: Send {
 5. **MR 注销同步等待**（§8.6）默认 500ms 超时是否合理？更长可能拖累控制面，更短可能让正常 inflight 被误判超时。
 6. **会话 epoch** 来源（§5.1）：`SystemTime` 纳秒低 32 位 vs `rand::random::<u32>()`？前者零依赖，后者更"正确"，toy 两者都够。
 7. **HELLO 交换**里 `initial_credits` 是否应该对称（两端相同）还是允许各自不同取 min（§6 目前选 min）。
+8. **NPU 模拟 backing**（§3.3）：首版用 `Vec<u8>` + `RwLock` 还是 `Box<[AtomicU8]>`？前者简单，后者对 `atomic_*` 更直观但浪费 8× 内存。`mem_size_mib` 默认 256 MiB 是否过大/过小？
 
 ---
 
