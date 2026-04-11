@@ -6,7 +6,7 @@
 | **文档状态** | Draft（待评审） |
 | **最后更新** | 2026-04-11 |
 
-本文在需求文档已拍板的默认决策（Go、YAML、UDP 默认、HTTP `/metrics`、128 bit UB 地址等）基础上，给出**可实现**的模块划分、协议头、状态机与关键算法约定；未写死的字段保留「实现可调整但须回归需求 FR」的弹性。
+本文在需求文档已拍板的默认决策（**Rust + tokio**、YAML、UDP 默认、HTTP `/metrics`、128 bit UB 地址等）基础上，给出**可实现**的模块划分、协议头、状态机与关键算法约定；未写死的字段保留「实现可调整但须回归需求 FR」的弹性。
 
 ---
 
@@ -14,7 +14,7 @@
 
 1. **语义优先于性能**：严格满足 FR-REL（至多一次）、FR-MEM-7（非原子无顺序）、FR-MSG-5（消息序仅 per jetty 对）、FR-FLOW（按 WR 的信用流控）。
 2. **逼近用户态软件上限**（与需求 1、2.2 一致）：首版以 **单 reactor + worker** 与 **零拷贝尽量局部化**（如 `[]byte` 视图、池化 buffer）为目标；**不**在首版绑定 RDMA/DPDK，但在 **§12 Fabric 抽象** 预留替换点，便于后续里程碑切换。
-3. **控制面 / 数据面隔离**：独立 goroutine 与独立 socket（或独立 QUIC 式多路前的双端口），避免控制 RPC 阻塞数据面。
+3. **控制面 / 数据面隔离**：独立 tokio task 与独立 socket（或独立 QUIC 式多路前的双端口），避免控制 RPC 阻塞数据面。
 4. **可测试**：传输层、分片重组、序号去重可纯单元测试；跨进程用脚本起 `unibusd`。
 
 ---
@@ -23,19 +23,19 @@
 
 ### 2.1 分层（对应 US-8）
 
-| 层 | 包（建议） | 职责 |
+| 层 | crate / 模块（建议） | 职责 |
 |---|---|---|
-| **Verb / 事务层** | `pkg/verbs`（或并入 `pkg/jetty`） | 将 `ub_read` / `ub_write` / `ub_send` 等转为 WR，投递 JFS；从 JFC 交付 CQE；同步 API 在此层封装 `Wait` |
-| **Jetty 资源层** | `pkg/jetty` | JFS/JFR/JFC 队列、深度、背压；`jetty_id` 分配；`flushed` CQE |
-| **MR / 地址** | `pkg/mr`, `pkg/addr` | 本地 MR 表、UB→VA 翻译；对齐检查；权限检查 |
-| **可靠传输** | `pkg/transport` | 每对 `(src_node, dst_node)` 的序号、ACK/SACK、重传定时器、去重窗口 |
-| **分片与重组** | `pkg/transport/fragment`（子目录） | 大于 PMTU 的 payload 切分；重组超时与内存上限 |
-| **网络成帧** | `pkg/wire` 或 `pkg/codec` | 定长头 + payload + 可选扩展头；版本、魔数 |
-| **Fabric** | `pkg/fabric` | UDP / TCP / UDS 实现 `Send`/`Recv`；连接表（TCP） |
-| **控制面** | `pkg/control` | 成员关系、MR 目录广播/拉取、心跳、节点状态机 |
-| **可观测** | `pkg/obs` | 计数器、日志、`/metrics`、tracing 钩子 |
-| **进程入口** | `cmd/unibusd` | 读配置、拉起各子系统 |
-| **CLI** | `cmd/unibusctl` | 子命令通过本地 HTTP admin 接口调用 `unibusd`（与 `/metrics` 共端口，path 前缀 `/admin`，见 §10） |
+| **Verb / 事务层** | `ub-core::verbs`（或并入 `ub-core::jetty`） | 将 `ub_read` / `ub_write` / `ub_send` 等转为 WR，投递 JFS；从 JFC 交付 CQE；同步 API 在此层对 async 版本封装 `block_on` |
+| **Jetty 资源层** | `ub-core::jetty` | JFS/JFR/JFC 队列、深度、背压；`jetty_id` 分配；`flushed` CQE |
+| **MR / 地址** | `ub-core::{mr, addr}` | 本地 MR 表、UB→VA 翻译；对齐检查；权限检查 |
+| **可靠传输** | `ub-transport` | 每对 `(src_node, dst_node)` 的序号、ACK/SACK、重传定时器、去重窗口 |
+| **分片与重组** | `ub-transport::fragment`（子模块） | 大于 PMTU 的 payload 切分；重组超时与内存上限 |
+| **网络成帧** | `ub-wire` | 定长头 + payload + 可选扩展头；版本、魔数 |
+| **Fabric** | `ub-fabric` | UDP / TCP / UDS 实现 `Fabric` / `Session` trait；连接/会话表 |
+| **控制面** | `ub-control` | 成员关系、MR 目录广播/拉取、心跳、节点状态机 |
+| **可观测** | `ub-obs` | 计数器、日志、`/metrics`、`tracing` span 钩子 |
+| **进程入口** | `unibusd`（bin crate） | 读配置、拉起 tokio runtime 与各子系统 |
+| **CLI** | `unibusctl`（bin crate） | 子命令通过本地 HTTP admin 接口调用 `unibusd`（与 `/metrics` 共端口，path 前缀 `/admin`，见 §10） |
 
 ```mermaid
 flowchart TB
@@ -62,12 +62,33 @@ flowchart TB
 
 ### 2.2 并发模型（Q6）
 
-- **Reactor（1 个 goroutine）**：阻塞或 `epoll` 风格事件循环（Go 中可用 `net.Conn` + `SetReadDeadline` 轮询或多 conn per peer）；负责 **所有 fabric 读**、将完整 **帧** 投递到每 peer 的 inbound channel；负责 **定时器 tick**（心跳、RTO）信号。
-- **Workers（默认 `runtime.NumCPU()`）**：
+- **Runtime**：`tokio` 多线程 runtime，工作线程数默认 `num_cpus::get()`。
+- **Reactor（1 个专用 tokio task）**：以 `tokio::select!` 驱动事件循环，多路复用 `tokio::net::UdpSocket::recv_from` / `TcpListener::accept` / `tokio::time::interval`（心跳、RTO tick）；将收到的完整 **帧** 通过 `tokio::sync::mpsc` 投递到每 peer 的 inbound channel。
+  - 由于 tokio 的 IO 驱动是多线程共享的，"1 个 reactor task" 在逻辑上只是事件多路分发器，内部并不强绑定单线程；但我们**约束**所有 fabric 读只从这一个 task 中出栈，以保证 inbound 顺序单点化。
+- **Workers（若干 tokio task）**：
   - 从 JFS 取 WR、组帧、交给 transport 发送队列；
   - 处理 inbound 帧：控制面消息、数据面 ACK、数据 payload、完成 JFC；
   - 不得在执行路径上直接阻塞于应用回调；CQE 入队由 worker 完成。
+  - 对 **应用侧回调**（例如同步 API 等 CQE）使用 `tokio::sync::Notify` 或 `oneshot::Sender` 唤醒，避免在 runtime 内部 `.await` 阻塞的同步调用。
 - **顺序保证**：同一 `(src_jetty_id, dst_jetty_id)` 的 **消息** 有序，在 **transport 层按 jetty 对建子队列** 或在 **jetty 层串行化 send 路径** 二选一；详细设计推荐 **jetty 层 per-dst 串行化 + transport 每 peer 总序**，避免 TCP 多流乱序（若未来一连接多 jetty）破坏 FR-MSG-5。首版 **建议每 (src_node, dst_node) 一条 TCP 连接或一条 UDP 会话上下文**，消息头带 `src_jetty/dst_jetty`，接收端按 `dst_jetty` 入队。
+
+### 2.3 关键 crate 选型
+
+| 用途 | Crate | 说明 |
+|---|---|---|
+| 异步 runtime | `tokio` | 多线程 runtime、`net`、`sync`、`time` features |
+| Trait 上 async | `async-trait` | 供 `Fabric` / `Session` 等 trait 用 |
+| buffer | `bytes` | `Bytes` / `BytesMut` 做零拷贝切片与池化 |
+| wire 编解码 | `byteorder` 或 std 的 `u64::to_be_bytes` | 不引入 `serde` 避免反射开销；**不用** `prost`（无 protobuf 依赖） |
+| 错误类型 | `thiserror` | 定义 `UbError` enum 映射到 `UB_ERR_*` |
+| 同步原语 | `parking_lot` | `Mutex` / `RwLock` 比 std 略快；异步场景仍用 `tokio::sync` |
+| 无锁队列 | `crossbeam::queue::ArrayQueue` | JFS MPSC 实现备选（§8.4） |
+| 配置 | `serde` + `serde_yaml` | YAML 解析 |
+| 日志 / tracing | `tracing` + `tracing-subscriber` | 结构化日志 + span，契合 FR-OBS-4 |
+| Prometheus | `metrics` + `metrics-exporter-prometheus` | `/metrics` 输出 |
+| 随机 | `rand` | `rand::random::<u32>()` 生成 epoch（§5.1） |
+| HTTP admin | `axum` 或 `hyper` 单独起一个 server | 承载 `/metrics` 与 `/admin`（CLI 后端） |
+| bench | `criterion` | `cargo bench`；命中 FR-NFR 性能指标验证 |
 
 ---
 
@@ -112,7 +133,7 @@ flowchart TB
 
 ### 4.2 通用帧头（建议 32 字节对齐前 24～32 B）
 
-字段（逻辑顺序，实际打包用 `encoding/binary` BigEndian）：
+字段（逻辑顺序，实际打包用 `byteorder::BigEndian` 或 `u{16,32,64}::to_be_bytes`；所有多字节整数一律大端）：
 
 | 偏移 | 长度 | 字段 |
 |---|---|---|
@@ -163,7 +184,7 @@ flowchart TB
 - **去重**：接收端维护大小为 W 的滑动窗口（如 1024）；`seq < next_expected` 且已确认 → 丢弃；`seq` 在窗口内重复 → 丢弃；**绝不再次执行写副作用**（FR-REL-5/6）。
 
 **崩溃恢复（会话 epoch）**：
-- 节点启动时生成一个进程级 `local_epoch`（`time.Now().UnixNano()` 低 32 位或 `crypto/rand`），在控制面 `HELLO` 消息里通告。
+- 节点启动时生成一个进程级 `local_epoch: u32`（`SystemTime::now().duration_since(UNIX_EPOCH).as_nanos() as u32` 或 `rand::random::<u32>()`），在控制面 `HELLO` 消息里通告。
 - 对端收到 `HELLO` 后，若发现 `remote_epoch` 与自己缓存中的不同（意味着对端重启过），**立即**失效旧 `ReliableSession`：未完成 WR 投递 `UB_ERR_LINK_DOWN`，重组表清空，dedup 窗口清空，按新 epoch 建会话。
 - 帧头 `Reserved` 4 B 的低 24 bit 首版不使用，高 8 bit 未来若需源路由再启用；epoch 不放在数据面帧头里（控制面交换 epoch 已足够），避免膨胀每帧。
 - **副作用**：对端重启期间未收到 ACK 的写会被本地标记为失败，应用感知到 `UB_ERR_LINK_DOWN` 后自行决定是否重试；与 **FR-REL-5 至多一次** 的承诺保持一致（重启=会话结束，不跨 epoch 补发）。
@@ -197,7 +218,7 @@ ACK 帧通用头的 `PayloadLen` = 16（无 SACK）或 48（含 SACK）。
   - 首次 `READ_REQ` 到达 → 执行本地读 → 写入缓存 → 发送 `READ_RESP`。
   - 重复 `READ_REQ` 到达 → **从缓存取出 RESP 重发**，**不能**简单丢弃（否则首次 RESP 丢失时请求永久 stuck）。
   - 缓存 miss（已过期）：允许重新执行本地读——读是幂等的，重复执行无副作用。
-  - 缓存命中路径走 worker goroutine，与本地读路径共享读锁即可，**禁止**阻塞读线程等待去重锁链导致死锁。
+  - 缓存命中路径走 worker task，与本地读路径共享读锁即可，**禁止**在 tokio task 里持长读锁阻塞其他 ready 任务导致死锁。
 - **读响应**重复：`READ_RESP` 带相同 `Opaque`；发送端若对应 WR 已完成则直接忽略。
 
 ### 5.5 写路径幂等（FR-REL-6）
@@ -268,9 +289,13 @@ ACK 帧通用头的 `PayloadLen` = 16（无 SACK）或 48（含 SACK）。
 
 ### 8.4 消息有序与 JFS 并发（FR-MSG-5）
 
-- **JFS 并发语义**：**多生产者 / 单消费者（MPSC）**。多个 app goroutine 可并发 `ub_send` / `ub_post_send` 同一 Jetty；实现用 Go 标准库 `sync.Mutex` 保护一个环形 buffer，或用无锁 MPSC 队列（如 `atomic.Pointer` + treiber stack 变种）。消费者固定为该 Jetty 绑定的一个 worker goroutine，取出顺序 = 入队顺序。
+- **JFS 并发语义**：**多生产者 / 单消费者（MPSC）**。多个 app task / 线程可并发 `ub_send` / `ub_post_send` 同一 Jetty；实现可选：
+  - **简洁版**：`parking_lot::Mutex<VecDeque<WorkRequest>>`，适合首版调试。
+  - **无锁版**：`crossbeam::queue::ArrayQueue<WorkRequest>`（MPMC 语义足以覆盖 MPSC），避免写路径竞争。
+  - **async 场景**：`tokio::sync::mpsc::channel`，但注意 `send().await` 会在满队列时挂起调用者；若需要 `EAGAIN` 风格非阻塞提交，用 `try_send`。
+  消费者固定为该 Jetty 绑定的一个 worker task（通过 `tokio::spawn` 启动并持有 `Notify` 被 post 路径唤醒），取出顺序 = 入队顺序。
 - **同 (src, dst) 顺序**：对 **同一** `(dst_node, dst_jetty)` 的 WR 在 **src** 侧以入队顺序串行化组帧和交付 transport；在 **dst** 侧按 `StreamSeq` 重排后入对应 JFR，匹配 `post_recv` 顺序。
-- **不同 dst 之间不保证顺序**：与 FR-MSG-5 一致，两个 dst_jetty 之间的 WR 可以在 worker 间并行处理。
+- **不同 dst 之间不保证顺序**：与 FR-MSG-5 一致，两个 dst_jetty 之间的 WR 可以被不同 worker task 并行处理。
 
 ### 8.5 跨语义顺序
 
@@ -280,13 +305,13 @@ ACK 帧通用头的 `PayloadLen` = 16（无 SACK）或 48（含 SACK）。
 
 `ub_mr_deregister(handle)` 是 **同步** API，调用方可以在返回后安全 `free(buf)`。实现细节：
 
-1. **状态机**：MR 有三态 `ACTIVE` → `REVOKING` → `RELEASED`。
-2. **引用计数**：MR 维护 `inflight_refs atomic.Int64`，在 **通过权限检查后、实际访问 buffer 前** `+1`，操作完成（或错误返回）后 `-1`。
+1. **状态机**：MR 有三态 `Active` → `Revoking` → `Released`（Rust enum，内部状态用 `AtomicU8` 存储以便 lock-free 判定）。
+2. **引用计数**：MR 维护 `inflight_refs: AtomicI64`，在 **通过权限检查后、实际访问 buffer 前** `fetch_add(1, Acquire)`，操作完成（或错误返回）后 `fetch_sub(1, Release)`。
 3. **deregister 流程**：
-   - 原子置 `state = REVOKING`（后续新到达帧会 short-circuit 到错误路径，**不再** `+1`）。
+   - 原子置 `state = Revoking`（`compare_exchange` 从 `Active`）；后续新到达帧会 short-circuit 到错误路径，**不再** `+1`。
    - 发送 `MR_REVOKE` 广播（fire-and-forget 至 hub / 全网）。
-   - **阻塞等待** `inflight_refs` 归零，或超时 `deregister_timeout_ms`（默认 500ms）→ 超时返回 `UB_ERR_TIMEOUT`，caller 决定是否重试（此时 `free(buf)` **不安全**）。
-   - `inflight_refs == 0` 后置 `state = RELEASED`，释放本地 MR 表项，返回 `UB_OK`。
+   - **异步等待** `inflight_refs` 归零：用 `tokio::sync::Notify`（在 `fetch_sub` 归零时 `notify_one`）或轮询 + `tokio::time::sleep`；总等待上限 `mr.deregister_timeout_ms`（默认 500ms）→ 超时返回 `UB_ERR_TIMEOUT`，caller 决定是否重试（此时 Rust 侧因为 `Arc<MrInner>` 引用计数未归零，buffer 其实仍被协议栈持有，不会真 UAF；但 `ub_mr_deregister` 仍然不能向上层承诺成功）。
+   - `inflight_refs == 0` 后置 `state = Released`，释放本地 MR 表项，返回 `UB_OK`。
 4. **新到达帧处理**：`state == REVOKING/RELEASED` 时，接收端返回 `ERR_RESP` 帧（`ExtFlags.ERR_RESP=1`，`status = UB_ERR_ADDR_INVALID`），**不** `inflight_refs++`、**不**访问 buffer。
 5. **本地 WR 未发出**：MR 已进入 `REVOKING` 时，直接在 JFC 生成 `UB_ERR_ADDR_INVALID` CQE，不发送网络帧。
 6. **peer 端缓存**：peer 收到 `MR_REVOKE` 后立即在本地 MR 元数据缓存中标记该区间无效；后续 WR 在本地就会被短路拒绝，不会再发出网络帧，从而加速 `inflight_refs` 归零。
@@ -303,7 +328,7 @@ ACK 帧通用头的 `PayloadLen` = 16（无 SACK）或 48（含 SACK）。
 
 - **计数器**（Prometheus gauge/counter 名称示例）：`unibus_tx_pkts_total`, `unibus_rx_pkts_total`, `unibus_retrans_total`, `unibus_drops_total`, `unibus_cqe_ok_total`, `unibus_cqe_err_total`, `unibus_mr_count`, `unibus_jetty_count`, `unibus_peer_rtt_ms`（histogram 可选）。
 - **`/metrics`**：默认绑定 `127.0.0.1:9090`（可配置），**仅本机** 以降低 toy 暴露面；需要远程采集时显式 `0.0.0.0`。
-- **Tracing（FR-OBS-4）**：定义接口 `type Tracer interface { Span(ctx, name string) func()` }`；默认 `noopTracer`。
+- **Tracing（FR-OBS-4）**：直接复用 `tracing` crate 的 `#[tracing::instrument]` 宏和 `tracing::Span`；默认用 `tracing_subscriber::fmt()` 输出到 stderr；OpenTelemetry 接入留作扩展（`tracing-opentelemetry`）。
 
 ---
 
@@ -349,36 +374,48 @@ heartbeat:
 
 ## 12. Fabric 抽象（扩展点）
 
-```go
-type Fabric interface {
-    Kind() string // "udp" | "tcp" | "uds"
-    // Listen 启动本端监听，返回 Listener 供 Accept 接受入站会话。
-    // UDP 实现：Listen 绑定本地 UDPConn；Accept 从 "首次见到的 peer 地址"
-    //          触发并返回一个以该地址为对端的 Session（demux 由 fabric 层完成）。
-    // TCP / UDS：对应标准 Listen + Accept 语义。
-    Listen(local PeerAddr) (Listener, error)
-    // Dial 主动建立到远端 data 地址的会话；UDP 可视为无连接 sendto 封装。
-    Dial(peer PeerAddr) (Session, error)
+```rust
+use async_trait::async_trait;
+use bytes::{Bytes, BytesMut};
+
+#[async_trait]
+pub trait Fabric: Send + Sync {
+    fn kind(&self) -> &'static str;  // "udp" | "tcp" | "uds"
+
+    /// 启动本端监听，返回 Listener 供 accept 接受入站会话。
+    /// UDP 实现：listen 绑定本地 `tokio::net::UdpSocket`；accept 从"首次见到的 peer
+    ///          地址"触发并返回一个以该地址为对端的 Session（demux 由 fabric 层完成）。
+    /// TCP / UDS：对应标准 `TcpListener::accept` / `UnixListener::accept`。
+    async fn listen(&self, local: PeerAddr) -> Result<Box<dyn Listener>, UbError>;
+
+    /// 主动建立到远端 data 地址的会话；UDP 下可视为无连接 `send_to` 的 per-peer 封装。
+    async fn dial(&self, peer: PeerAddr) -> Result<Box<dyn Session>, UbError>;
 }
 
-type Listener interface {
-    // Accept 阻塞直到有新会话到来或 ctx 取消。
-    Accept(ctx context.Context) (Session, error)
-    Close() error
+#[async_trait]
+pub trait Listener: Send {
+    /// 异步等待新会话到来；可通过 drop Listener 或外层 `tokio::select!` + `CancellationToken`
+    /// 取消等待。
+    async fn accept(&mut self) -> Result<Box<dyn Session>, UbError>;
 }
 
-type Session interface {
-    Peer() PeerAddr
-    Send(ctx context.Context, pkt []byte) error
-    // Recv 返回的 []byte 归 Session 所有；调用方必须在下次 Recv 调用前完成读取或自行拷贝。
-    // transport 层应通过 sync.Pool 复用 buffer 以避免频繁分配。
-    Recv(ctx context.Context) ([]byte, error)
-    Close() error
+#[async_trait]
+pub trait Session: Send {
+    fn peer(&self) -> PeerAddr;
+
+    async fn send(&mut self, pkt: &[u8]) -> Result<(), UbError>;
+
+    /// 返回的 `BytesMut` 可能由 Session 内部 buffer 池借出；调用方在下一次 `recv().await`
+    /// 之前必须完成消费或用 `.freeze()` 转成 `Bytes`（零拷贝引用计数）。
+    /// 上层 transport 应通过 `BytesMut` 池（如手写的 `Arc<Mutex<Vec<BytesMut>>>` 或
+    /// `bytes-pool` crate）复用内存，避免频繁分配。
+    async fn recv(&mut self) -> Result<BytesMut, UbError>;
 }
 ```
 
-- **UDP**：`ReliableSession` 完全在 `pkg/transport`；fabric 层用单条 `UDPConn` + `src_addr → Session` map 做 demux。
+- **UDP**：`ReliableSession` 完全在 `ub-transport`；`ub-fabric::udp` 用单个 `tokio::net::UdpSocket` + `DashMap<PeerAddr, mpsc::Sender<BytesMut>>` 做 demux，Accept 侧在看到新 `src_addr` 时懒创建一个 Session。
 - **TCP / UDS**：`Listener` 接收连接后用 `HELLO` 交换 `(NodeID, epoch)`，完成后把 `Session` 交给 transport。**推荐 TCP 仍走 transport 统一路径**（帧格式 + 可靠逻辑一致），只是在 TCP 下丢包概率为 0，RTO 重传几乎不触发，连接断开视作 `UB_ERR_LINK_DOWN`。
+- **为什么用 `Box<dyn Trait>` 而不是泛型 / GAT**：fabric 选择在运行时由配置决定，动态分发开销可忽略；若后续 bench 显示虚表调用成为瓶颈，再局部替换成 enum 派发或泛型。
 
 ---
 
@@ -399,7 +436,7 @@ type Session interface {
 |---|---|
 | 单元 | 分片重组、序号窗口、SACK 解码、credit 窗口、YAML 解析、MR 引用计数（§8.6）、读重复缓存（§5.4） |
 | 集成 | 两进程本机 UDP/TCP 互打；1% 随机丢包注入（udp wrapper），断言 FR-REL-5 至多一次 |
-| 并发 | 多 goroutine `atomic_cas` 同一 UB 字；多 goroutine 并发 `ub_send` 同一 JFS（§8.4 MPSC） |
+| 并发 | 多 tokio task `atomic_cas` 同一 UB 字；多 task 并发 `ub_send` 同一 JFS（§8.4 MPSC） |
 | 故障注入 | (a) 被动 kill peer → 本端 ≤5s 感知并把未完成 WR 置 `UB_ERR_LINK_DOWN`；(b) peer 重启（换新 epoch）→ 本端旧 session 正确失效；(c) `ub_mr_deregister` 期间 peer 仍在发 WRITE → ref-count 归零后才返回 |
 | 性能 | `unibusctl bench write --size 1024` 本机 loopback 吞吐 ≥ 50K ops/s；端到端延迟 P50 < 200μs（需求非功能指标） |
 | E2E | shell 脚本起 3×`unibusd` + `unibusctl` 断言 `node list` / `mr list`；跑完 KV demo |
@@ -410,11 +447,11 @@ type Session interface {
 
 | 里程碑 | 主要代码落点 |
 |---|---|
-| M1 | `pkg/control`, `cmd/unibusd`, `cmd/unibusctl node` |
-| M2 | `pkg/mr`, `pkg/addr`, `pkg/transport` + verbs read/write/atomic |
-| M3 | `pkg/jetty`, send/recv/imm |
+| M1 | `ub-control`, `unibusd`, `unibusctl`（`node` 子命令） |
+| M2 | `ub-core::{mr, addr}`, `ub-transport` + verbs read/write/atomic |
+| M3 | `ub-core::jetty`, send/recv/imm |
 | M4 | 完整 FR-REL + FR-FLOW + FR-FAIL |
-| M5 | `pkg/obs`, bench, KV demo |
+| M5 | `ub-obs`, `criterion` bench, KV demo |
 
 ---
 
@@ -425,7 +462,7 @@ type Session interface {
 3. **默认 Jetty 与显式 Jetty**：§8.3 推荐「每节点一个默认 Jetty」但未强制；是否在 SDK 文档里硬性要求 verb 必须显式传 Jetty？
 4. **读重复缓存**（§5.4）已强制 LRU，默认 1024 条 / TTL 5s，是否需要改为更小或做成可配置？
 5. **MR 注销同步等待**（§8.6）默认 500ms 超时是否合理？更长可能拖累控制面，更短可能让正常 inflight 被误判超时。
-6. **会话 epoch** 来源（§5.1）：用 `UnixNano` 还是 `crypto/rand`？前者在 1ns 分辨率下重启极难重复，后者更"正确"但多一行代码。
+6. **会话 epoch** 来源（§5.1）：`SystemTime` 纳秒低 32 位 vs `rand::random::<u32>()`？前者零依赖，后者更"正确"，toy 两者都够。
 7. **HELLO 交换**里 `initial_credits` 是否应该对称（两端相同）还是允许各自不同取 min（§6 目前选 min）。
 
 ---
