@@ -74,8 +74,8 @@ AI 大模型时代，"Scale-Up 域"（一个紧耦合的计算单元集合，对
 
 | 文档 | 说明 |
 |---|---|
-| [REQUIREMENTS.md](./REQUIREMENTS.md) | 功能需求、用户故事、验收标准、里程碑定义 |
-| [DESIGN.md](./DESIGN.md) | 详细设计：Part I verbs 层（M1–M5）/ Part II managed 层（M7）/ Part III 测试与里程碑 |
+| [docs/REQUIREMENTS.md](./docs/REQUIREMENTS.md) | 功能需求、用户故事、验收标准、里程碑定义 |
+| [docs/DESIGN.md](./docs/DESIGN.md) | 详细设计：Part I verbs 层（M1–M5）/ Part II managed 层（M7）/ Part III 测试与里程碑 |
 
 ---
 
