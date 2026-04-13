@@ -26,6 +26,7 @@
 - [14. Demo 与验收](#14-demo-与验收)
 - [15. 测试计划](#15-测试计划)
 - [16. 里程碑与交付映射](#16-里程碑与交付映射)
+- [17. 补充设计：跨模块衔接与实现细节](#17-补充设计跨模块衔接与实现细节)
 
 ---
 
@@ -1676,3 +1677,613 @@ sequenceDiagram
 | **M7.6** | 3 节点 KV cache demo + CLI/metrics 完善 | 全部验收条件满足 |
 
 **M7.3 结束即可停**（得到一个"弱一致版 managed layer"可演示结果）——这是为什么把 cache 和 invalidate 拆成两步。
+
+---
+
+## 17. 补充设计：跨模块衔接与实现细节
+
+> 本章补充前面章节中未充分展开的跨模块衔接点、实现细节与边界条件。每节标注对应的主章节，确保逻辑完整闭环。
+
+### 17.1 Verbs 层 SDK API 完整签名（补充 §8, FR-API-2/3）
+
+需求 FR-API-2 要求首版提供 Rust 原生 crate API；FR-API-3 要求区分 async / sync。以下给出完整的公开 API 签名：
+
+```rust
+// ========== 句柄类型 ==========
+
+pub struct UbAddr(pub u128);       // UB 地址
+pub struct MrHandle(pub u32);      // 本地 MR 句柄
+pub struct JettyHandle(pub u32);   // 本地 Jetty 句柄
+
+#[derive(Copy, Clone, Debug)]
+pub struct JettyAddr {
+    pub node_id: u16,
+    pub jetty_id: u32,
+}
+
+// ========== MR 管理 ==========
+
+/// 注册一段 device 存储为 MR，返回 (UB 地址, MR 句柄)
+/// - CPU 内存: device 传入 DeviceKind::Memory, buf 传入 &mut [u8]
+/// - NPU 显存: device 传入 DeviceKind::Npu, buf 传入 (npu_handle, offset)
+pub fn ub_mr_register(
+    device: DeviceKind,
+    buf_or_offset: MrBacking,
+    len: u64,
+    perms: MrPerms,
+) -> Result<(UbAddr, MrHandle), UbError>;
+
+/// 注销 MR，等待 inflight 归零后释放
+pub async fn ub_mr_deregister(handle: MrHandle) -> Result<(), UbError>;
+
+// ========== 内存语义（异步版本） ==========
+
+/// 单边读：从远端 UB 地址读取 len 字节到 local_buf
+pub async fn ub_read(
+    jetty: JettyHandle,
+    remote_ub_addr: UbAddr,
+    local_buf: &mut [u8],
+    len: u64,
+) -> Result<WrId, UbError>;
+
+/// 单边写：将 local_buf 写入远端 UB 地址
+pub async fn ub_write(
+    jetty: JettyHandle,
+    remote_ub_addr: UbAddr,
+    local_buf: &[u8],
+    len: u64,
+) -> Result<WrId, UbError>;
+
+/// 原子比较交换
+pub async fn ub_atomic_cas(
+    jetty: JettyHandle,
+    remote_ub_addr: UbAddr,
+    expect: u64,
+    new: u64,
+) -> Result<WrId, UbError>;
+
+/// 原子加
+pub async fn ub_atomic_faa(
+    jetty: JettyHandle,
+    remote_ub_addr: UbAddr,
+    add: u64,
+) -> Result<WrId, UbError>;
+
+// ========== 内存语义（同步包装） ==========
+
+/// 同步读：阻塞直到完成，直接返回结果
+pub fn ub_read_sync(
+    jetty: JettyHandle,
+    remote_ub_addr: UbAddr,
+    local_buf: &mut [u8],
+    len: u64,
+) -> Result<(), UbError>;
+
+/// 同步写
+pub fn ub_write_sync(
+    jetty: JettyHandle,
+    remote_ub_addr: UbAddr,
+    local_buf: &[u8],
+    len: u64,
+) -> Result<(), UbError>;
+
+// ========== 消息语义（异步版本） ==========
+
+/// 双边发送
+pub async fn ub_send(
+    jetty: JettyHandle,
+    dst: JettyAddr,
+    buf: &[u8],
+    len: u64,
+) -> Result<WrId, UbError>;
+
+/// 带立即数发送
+pub async fn ub_send_with_imm(
+    jetty: JettyHandle,
+    dst: JettyAddr,
+    buf: &[u8],
+    len: u64,
+    imm: u64,
+) -> Result<WrId, UbError>;
+
+/// 写后带立即数通知
+pub async fn ub_write_with_imm(
+    jetty: JettyHandle,
+    remote_ub_addr: UbAddr,
+    buf: &[u8],
+    len: u64,
+    imm: u64,
+) -> Result<WrId, UbError>;
+
+/// 投递接收缓冲
+pub async fn ub_post_recv(
+    jetty: JettyHandle,
+    buf: &mut [u8],
+    len: u64,
+) -> Result<WrId, UbError>;
+
+// ========== CQE 轮询 ==========
+
+/// 非阻塞 poll：返回下一个 CQE，无就绪时返回 None
+pub fn ub_poll_cqe(jetty: JettyHandle) -> Option<Cqe>;
+
+/// 阻塞等待下一个 CQE
+pub async fn ub_wait_cqe(jetty: JettyHandle) -> Cqe;
+
+// ========== Jetty 管理 ==========
+
+/// 创建 Jetty
+pub fn ub_jetty_create(attrs: JettyAttrs) -> Result<JettyHandle, UbError>;
+
+/// 销毁 Jetty（所有未完成 WR 生成 flushed CQE）
+pub async fn ub_jetty_close(jetty: JettyHandle) -> Result<(), UbError>;
+
+/// 获取默认 Jetty（供内存语义使用）
+pub fn ub_default_jetty() -> JettyHandle;
+
+// ========== NPU Device ==========
+
+pub fn ub_npu_open(mem_size_mib: u64) -> Result<NpuHandle, UbError>;
+pub fn ub_npu_alloc(handle: NpuHandle, len: u64, align: u64) -> Result<(u64, u64), UbError>;
+```
+
+**设计要点**：
+
+- 所有异步 API 返回 `WrId`（即 `u64`），应用通过 `ub_poll_cqe` / `ub_wait_cqe` 取回 CQE 获知结果。
+- 同步 API 内部对异步版本做 `block_on` 封装，超时由配置 `sync_api_timeout_ms` 控制（默认 5s）。
+- `ub_default_jetty()` 返回进程启动时自动创建的默认 Jetty，简化 CLI / bench 的使用。
+- `MrBacking` 是一个枚举，区分 CPU 内存 slice 与 NPU offset。
+
+### 17.2 CQE 完整数据结构（补充 §8.2）
+
+```rust
+pub struct Cqe {
+    pub wr_id: u64,              // 对应 WR 的标识
+    pub status: UbStatus,        // UB_OK 或 UB_ERR_xxx
+    pub imm: Option<u64>,        // 立即数（write_with_imm / send_with_imm）
+    pub byte_len: u32,           // 实际传输字节数
+    pub jetty_id: u32,           // 产生此 CQE 的 Jetty
+    pub verb: Verb,              // 原始 verb 类型
+}
+
+pub type UbStatus = u32;        // 0 = UB_OK, 其他 = UB_ERR_xxx
+pub type WrId = u64;
+```
+
+**关键语义**：
+- 每个 CQE 与唯一的 `wr_id` 对应。
+- 错误 CQE 的 `byte_len = 0`，`imm = None`。
+- `flushed` CQE 的 `status = UB_ERR_FLUSHED`。
+
+### 17.3 控制面消息成帧与编码（补充 §7）
+
+数据面使用自定义二进制帧格式，控制面走 TCP 且消息类型差异大，需要独立的成帧协议。
+
+#### 控制面帧格式
+
+```
++-------------------+-------------------+-------------------+
+|  Length (4B BE)   |  MsgType (1B)     |  Payload (N B)    |
++-------------------+-------------------+-------------------+
+```
+
+| 字段 | 长度 | 说明 |
+|---|---|---|
+| Length | 4 B, 大端 | payload 字节数（不含 Length 和 MsgType） |
+| MsgType | 1 B | 控制面消息类型枚举 |
+| Payload | N B | 由 MsgType 决定具体结构 |
+
+#### 控制面消息类型枚举
+
+| MsgType 值 | 名称 | 说明 |
+|---|---|---|
+| 0x01 | `HELLO` | 会话建立 |
+| 0x02 | `HELLO_ACK` | 会话确认 |
+| 0x03 | `MEMBER_UP` | 新节点上线 |
+| 0x04 | `MEMBER_DOWN` | 节点下线 |
+| 0x05 | `MEMBER_SNAPSHOT` | Seed 下发全网视图 |
+| 0x06 | `MR_PUBLISH` | MR 上线广播 |
+| 0x07 | `MR_REVOKE` | MR 注销广播 |
+| 0x08 | `HEARTBEAT` | 心跳 |
+| 0x09 | `HEARTBEAT_ACK` | 心跳确认 |
+| 0x10 | `JOIN` | 新节点加入请求（seed 模式） |
+| 0x20 | `DEVICE_PROFILE_PUBLISH` | M7: Device 画像 |
+| 0x21 | `ALLOC_REQ` | M7: 分配请求 |
+| 0x22 | `ALLOC_RESP` | M7: 分配响应 |
+| 0x23 | `REGION_CREATE` | M7: Region 创建 |
+| 0x24 | `REGION_DELETE` | M7: Region 删除 |
+| 0x25 | `FETCH` | M7: 数据拉取 |
+| 0x26 | `FETCH_RESP` | M7: 数据拉取响应 |
+| 0x27 | `WRITE_LOCK_REQ` | M7: 写锁请求 |
+| 0x28 | `WRITE_LOCK_GRANTED` | M7: 写锁授予 |
+| 0x29 | `WRITE_UNLOCK` | M7: 写锁释放 |
+| 0x2A | `INVALIDATE` | M7: 失效通知 |
+| 0x2B | `INVALIDATE_ACK` | M7: 失效确认 |
+
+Verbs 层消息（0x01–0x10）与 Managed 层消息（0x20+）分段不冲突，未识别的 MsgType 直接丢弃并记日志。
+
+#### HELLO 消息 Payload
+
+| 偏移 | 长度 | 字段 |
+|---|---|---|
+| 0 | 2 | NodeID |
+| 2 | 2 | Version |
+| 4 | 4 | local_epoch |
+| 8 | 4 | initial_credits |
+| 12 | 4 | data_addr_len |
+| 16 | N | data_addr（UTF-8 字符串，如 "10.0.0.1:7901"） |
+
+#### MR_PUBLISH 消息 Payload
+
+| 偏移 | 长度 | 字段 |
+|---|---|---|
+| 0 | 2 | owner_node |
+| 2 | 4 | mr_handle |
+| 6 | 16 | base_ub_addr（128 bit UB 地址） |
+| 22 | 8 | len |
+| 30 | 1 | perms（位掩码） |
+| 31 | 1 | device_kind（0=MEMORY, 1=NPU） |
+
+### 17.4 优雅关机流程（补充 §7.4, §8.7）
+
+当 `unibusd` 收到 SIGTERM / SIGINT 或调用 `unibusctl node stop` 时：
+
+```mermaid
+flowchart TD
+  A["收到 shutdown 信号"] --> B["置节点状态 = Leaving"]
+  B --> C["停止接受新 JFS 投递 (JFS 入口返回 UB_ERR_NO_RESOURCES)"]
+  C --> D["广播 MEMBER_DOWN (原因=graceful)"]
+  D --> E["等待所有 inflight WR 完成 (带超时)"]
+  E --> F["对所有本地 Jetty 执行 jetty_close: 生成 flushed CQE"]
+  F --> G["对所有本地 MR 执行 ub_mr_deregister (简化版: 不等 inflight)"]
+  G --> H["关闭数据面 socket"]
+  H --> I["关闭控制面 TCP 连接"]
+  I --> J["停止 HTTP admin server"]
+  J --> K["停止 tokio runtime, 进程退出"]
+```
+
+**超时保护**：整个优雅关机有总超时 `shutdown_timeout_ms`（默认 3s），超时后强制退出——此时 `Arc<MrInner>` 引用计数未归零的 buffer 由进程退出自动回收，不会 UAF。
+
+**信号处理**：使用 `tokio::signal::ctrl_c()` 和 `tokio::signal::unix::SignalKind::terminate()` 注册信号 handler，通过 `CancellationToken` 通知所有 task 退出。
+
+### 17.5 RTT 测量机制（补充 §5, §6）
+
+RTT 是 RTO 计算和 AIMD 拥塞控制的输入，测量方式：
+
+```mermaid
+flowchart TD
+  A["发送数据帧, 记录 sent_at = Instant::now()"] --> B["收到对应 ACK"]
+  B --> C["rtt_sample = now - sent_at"]
+  C --> D["SRTT = 7/8 * SRTT + 1/8 * rtt_sample (EWMA)"]
+  D --> E["RTTVAR = 3/4 * RTTVAR + 1/4 * |SRTT - rtt_sample|"]
+  E --> F["RTO_0 = SRTT + 4 * RTTVAR"]
+```
+
+- **首次 RTT 采样**：在 `ReliableSession` 建立后的第一个被 ACK 确认的数据帧。
+- **重传歧义**：重传过的帧不更新 RTT 采样（Karn 算法），避免采样值偏大。
+- **暴露指标**：`unibus_peer_rtt_ms{peer=N}` histogram，基于 SRTT 值。
+- **心跳复用**：控制面心跳也携带时间戳，可作为备用 RTT 来源（但精度不如数据面采样）。
+
+### 17.6 JFR 接收缓冲匹配（补充 §8.5）
+
+SEND 帧到达接收端后需要匹配一个 post_recv 缓冲，匹配规则：
+
+```mermaid
+flowchart TD
+  A["收到 SEND 帧 (dst_jetty, payload)"] --> B["查 dst_jetty 的 JFR"]
+  B --> C{"JFR 中有未匹配的 post_recv?"}
+  C -->|"是"| D["取出最早 post_recv buffer"]
+  D --> E["将 payload 拷入 buffer (截断到 buf.len)"]
+  E --> F["构造 CQE (status=OK, byte_len=payload.len) → JFC"]
+  C -->|"否"| G["JFR 为空: 无接收缓冲"]
+  G --> H["策略1 (首版): 丢弃消息, 计数 unibus_recv_drops_total"]
+  G --> I["策略2 (后续): 暂存到 pending_recv_queue, 等 post_recv 时匹配"]
+```
+
+**首版选择策略 1**（丢弃 + 计数），理由：
+- 简单，无额外内存管理。
+- 符合 RDMA 行为——无 post_recv 时消息丢失。
+- 应用有责任提前 post_recv，丢包是应用 bug 的信号。
+
+### 17.7 发送端 MR 查找与远端地址解析（补充 §3, §4）
+
+应用调用 `ub_write(remote_ub_addr, ...)` 时，发送端需要知道远端 MR 的本地句柄（`MRHandle`）才能填入 DATA 扩展头。
+
+```mermaid
+flowchart TD
+  A["应用: ub_write(remote_ub_addr, buf)"] --> B["解析 UB 地址: (PodID, NodeID, DeviceID, Offset)"]
+  B --> C["查本地 MR 元数据缓存: (NodeID, DeviceID, Offset) → MrCacheEntry"]
+  C --> D{"缓存命中?"}
+  D -->|"是"| E["取出 remote_mr_handle + 验证权限"]
+  D -->|"否"| F["返回 UB_ERR_ADDR_INVALID (MR 尚未广播到本节点)"]
+  E --> G{"权限检查: WR 的 verb ⊆ MR perms?"}
+  G -->|"是"| H["构造 DATA 帧, 填入 MRHandle = remote_mr_handle"]
+  G -->|"否"| I["返回 UB_ERR_PERM_DENIED"]
+```
+
+**MrCacheEntry 数据结构**：
+
+```rust
+pub struct MrCacheEntry {
+    pub remote_mr_handle: u32,  // 远端 MR 在远端节点内的句柄
+    pub owner_node: u16,
+    pub base_ub_addr: UbAddr,
+    pub len: u64,
+    pub perms: MrPerms,
+    pub device_kind: DeviceKind,
+}
+```
+
+- 此缓存由控制面 `MR_PUBLISH` / `MR_REVOKE` 维护。
+- 远端 MR handle 由 owner 节点在 `MR_PUBLISH` 时广播，各节点本地缓存。
+- 缓存未命中 = MR 还未广播到本节点 = 返回 `UB_ERR_ADDR_INVALID`，应用应重试。
+
+### 17.8 NpuDevice atomic 实现方案（补充 §3.6）
+
+§3.6 提到首版用 `Vec<u8>` + `parking_lot::RwLock`，但 `RwLock<Vec<u8>>` 无法直接做 `AtomicU64` 操作。解决方案：
+
+**方案：按 8 字节对齐的 `Vec<AtomicU64>` + 字节数组混合**
+
+```rust
+pub struct NpuDevice {
+    device_id: u16,
+    mem_size: u64,
+    // 字节数组用于 read/write 大块数据
+    data: RwLock<Vec<u8>>,
+    // 8 字节对齐区域用于 atomic 操作
+    // 由于模拟 NPU 的 backing 本质是进程内存，
+    // atomic 操作通过对 data 的写锁 + 手动对齐检查实现
+}
+```
+
+**首版简化**：NPU 的 `atomic_cas` / `atomic_faa` 实现：
+1. 获取 `data.write()` 锁。
+2. 检查 offset 8 字节对齐。
+3. 从 `data[offset..offset+8]` 用 `u64::from_be_bytes` 读取当前值。
+4. 执行 CAS/FAA 逻辑。
+5. 用 `new_value.to_be_bytes()` 写回 `data[offset..offset+8]`。
+6. 释放锁。
+
+**性能说明**：NPU 是纯软件模拟，atomic 操作需要写锁是可接受的——真实 NPU 会有硬件原子指令。toy 级别不需要无锁实现。
+
+### 17.9 协议版本不匹配处理（补充 §4.3）
+
+通用帧头包含 `Version` 字段（首版 = 1）。收到不匹配版本时的处理：
+
+```mermaid
+flowchart TD
+  A["解码帧头, 读取 Version"] --> B{"Version == 本端版本?"}
+  B -->|"是"| C["正常处理"]
+  B -->|"否"| D{"Version < 本端版本?"}
+  D -->|"是"| E["丢弃帧, 计数 unibus_version_mismatch_total"]
+  D -->|"否"| F["丢弃帧, 计数 unibus_version_mismatch_total, 记日志 WARN"]
+  E --> G["回复 ACK (携带本端版本号, 供对端诊断)"]
+  F --> G
+```
+
+- 首版只有 Version=1，收到任何非 1 的帧直接丢弃。
+- ACK 帧的 Reserved 字段首版填 0，未来可用于携带本端版本信息。
+- 不做自动版本协商——Toy 级别所有节点应运行相同版本。
+
+### 17.10 Managed 层额外计数器（补充 §10.2）
+
+| 计数器名 | 类型 | 标签 | 说明 |
+|---|---|---|---|
+| `unibus_placement_decision_total` | Counter | `tier=hot\|warm\|cold` | Placement 决策次数，按目标 tier |
+| `unibus_region_cache_hit_total` | Counter | | 本地 Shared 副本命中次数 |
+| `unibus_region_cache_miss_total` | Counter | | 本地 Shared 副本未命中次数 |
+| `unibus_invalidate_sent_total` | Counter | | Home 发出的 invalidate 消息数 |
+| `unibus_invalidate_recv_total` | Counter | | Reader 收到的 invalidate 消息数 |
+| `unibus_write_lock_wait_ms` | Histogram | | Writer 等待写锁耗时分布 |
+| `unibus_region_count` | Gauge | `state=home\|shared\|invalid` | 当前 region 数量，按状态分 |
+| `unibus_fetch_total` | Counter | | FETCH 请求数 |
+| `unibus_fetch_bytes_total` | Counter | | FETCH 传输字节数 |
+| `unibus_writer_lease_timeout_total` | Counter | | Writer lease 超时次数 |
+
+### 17.11 同节点短路路径（补充 §8）
+
+当发送端和接收端在同一节点进程内时，数据不应走网络，应直接在进程内传递：
+
+```mermaid
+flowchart TD
+  A["应用: ub_send(jetty, dst, buf)"] --> B{"dst.node_id == 本节点?"}
+  B -->|"是"| C["短路路径: 直接将 payload 投递到 dst Jetty 的 JFR"]
+  C --> D["构造 CQE → dst JFC"]
+  D --> E["构造 CQE → src JFC (发送完成)"]
+  B -->|"否"| F["正常路径: 组帧 → transport → fabric → 远端"]
+```
+
+**短路路径规则**：
+- **内存语义**（read/write/atomic）：直接调用本地 `Device` trait 方法，跳过 transport 和 fabric。
+- **消息语义**（send/recv）：直接从 src JFS 搬运到 dst JFR，跳过 transport 和 fabric。
+- **顺序保证**：短路路径仍遵守 FR-MSG-5——同 (src_jetty, dst_jetty) 有序。
+- **流控**：短路路径同样受信用流控约束——信用不足时一样背压。
+
+### 17.12 READ_RESP 关联回 READ_REQ（补充 §5.6, §8）
+
+READ_RESP 需要正确匹配回原始 READ_REQ，机制：
+
+- READ_REQ 帧的 `Opaque` 字段填入 `wr_id`。
+- READ_RESP 帧携带相同的 `Opaque` 值。
+- 发送端收到 READ_RESP 后，通过 `Opaque` 查找对应的未完成 WR，构造 CQE 入 JFC。
+
+```mermaid
+flowchart TD
+  A["发送端: 发出 READ_REQ, Opaque=wr_id"] --> B["记录 pending_reads[wr_id] = WrState"]
+  B --> C["接收端: 执行本地读, 构造 READ_RESP"]
+  C --> D["READ_RESP 帧携带相同 Opaque"]
+  D --> E["发送端收到 READ_RESP"]
+  E --> F["取出 Opaque, 查 pending_reads[wr_id]"]
+  F --> G["构造 CQE (status=OK, byte_len=len) → JFC"]
+  G --> H["从 pending_reads 移除 wr_id"]
+```
+
+### 17.13 控制面 TCP 断连重连（补充 §7）
+
+控制面 TCP 连接可能因网络抖动或对端重启断开。处理策略：
+
+```mermaid
+flowchart TD
+  A["检测到 TCP 连接断开"] --> B{"本端是主动连接方?"}
+  B -->|"是"| C["启动重连定时器 (指数退避, 初始 1s, 上限 30s)"]
+  C --> D["重新发起 TCP 连接"]
+  D --> E{"连接成功?"}
+  E -->|"是"| F["重新交换 HELLO (可能发现 epoch 变化)"]
+  E -->|"否"| G["退避后重试"]
+  B -->|"否"| H["等待对端重连 (被动方不主动)"]
+  H --> I["超过 heartbeat.fail_after * interval 未重连 → 标记 Down"]
+```
+
+**规则**：
+- **Static 模式**：本端在 `peers` 列表中排在对方前面的是主动连接方（避免双向同时重连）。
+- **Seed/Hub 模式**：非 hub 节点总是主动重连 hub。
+- 重连后必须重新交换 HELLO，检测 epoch 变化。
+- 重连期间数据面会话仍可工作（数据面 UDP 不依赖控制面 TCP），但 MR 变更无法传播。
+
+### 17.14 Payload 尺寸上限与溢出（补充 §4, FR-MEM-6）
+
+FR-MEM-6 要求单次操作 payload 上限至少 1 MiB。具体约束：
+
+| 场景 | 上限 | 说明 |
+|---|---|---|
+| 单次 WR payload | `min(MR.len - offset, max_wr_payload)` | 不超过 MR 剩余空间 |
+| `max_wr_payload` | 16 MiB（配置可调） | 防止单个 WR 占满重组缓冲 |
+| 单片 payload | `PMTU - 80` ≈ 1320 B | 受 UDP MTU 限制 |
+| 最大分片数 | `65535`（FragTotal 为 uint16） | 理论上限 |
+| 重组缓冲总大小 | `reassembly_budget_bytes` 默认 64 MiB | 全局共享 |
+
+**溢出检查**：
+- 发送端：`payload.len > max_wr_payload` → 返回 `UB_ERR_PAYLOAD_TOO_LARGE`。
+- 发送端：`offset + len > MR.len` → 返回 `UB_ERR_PAYLOAD_TOO_LARGE`。
+- 接收端：重组缓冲不足 → 拒绝新首片，计数 `unibus_reassembly_rejects_total`。
+
+### 17.15 SACK 快速重传触发条件（补充 §5.4）
+
+除了超时重传，还支持基于 SACK 的快速重传：
+
+```mermaid
+flowchart TD
+  A["收到 ACK 帧"] --> B{"HAS_SACK 置位?"}
+  B -->|"是"| C["解析 SackBitmap"]
+  C --> D["统计: 有多少个 ACK 确认了 seq > X 但 X 本身未确认"]
+  D --> E{"同一 seq 被跳过 ≥ 3 次?"}
+  E -->|"是"| F["触发快速重传: 立即重发 seq=X 的帧"]
+  E -->|"否"| G["等待正常 RTO 超时重传"]
+```
+
+- **3 次重复 SACK 触发快速重传**（与 TCP Reno/Fast Retransmit 类似）。
+- 快速重传后 **不** 重置 RTO 计数器（RTO 退避只在超时重传时触发）。
+- 快速重传次数计入 `max_retries` 限制。
+
+### 17.16 Buffer 池管理策略（补充 §2.5, §9）
+
+零拷贝路径依赖 `Bytes` / `BytesMut` 的引用计数，但频繁分配释放影响性能。首版策略：
+
+```rust
+/// 全局 buffer 池，用于 fabric recv 和 transport 分片
+pub struct BufferPool {
+    /// 固定大小 buffer 池（用于 PMTU 级别的帧收发）
+    small: Mutex<Vec<BytesMut>>,    // 每块 2048 B
+    /// 大 buffer 池（用于重组后的完整 payload）
+    large: Mutex<Vec<BytesMut>>,    // 每块 1 MiB
+    /// 统计
+    alloc_count: AtomicU64,
+    recycle_count: AtomicU64,
+}
+```
+
+- **分配**：`pool.alloc(size)` — 优先从池中取，池空则 `BytesMut::with_capacity(size)` 新分配。
+- **回收**：当 `BytesMut` 的引用计数归零（`Bytes` drop）时，自动回收进池。
+- **池大小**：`small` 池上限 1024 块，`large` 池上限 64 块。超限的回收直接释放。
+- **统计指标**：`unibus_buffer_pool_size{type=small|large}`，`unibus_buffer_alloc_total`，`unibus_buffer_recycle_total`。
+
+### 17.17 MR Offset 分配算法（补充 §3.3）
+
+FR-ADDR-3 要求 Offset 空间不重叠。每个 Device 维护独立的 Offset 分配器：
+
+```rust
+pub struct OffsetAllocator {
+    /// 已分配区间列表: [(base, len)]
+    allocated: Vec<(u64, u64)>,
+    /// 下一个候选起始偏移（bump allocator）
+    cursor: u64,
+}
+
+impl OffsetAllocator {
+    /// 分配 len 字节的连续空间，返回 base_offset
+    pub fn alloc(&mut self, len: u64, align: u64) -> Result<u64, UbError> {
+        // 对齐 cursor
+        let aligned = align_up(self.cursor, align);
+        // 检查不与已分配区间重叠（bump allocator 下自然不重叠）
+        self.cursor = aligned + len;
+        if self.cursor > self.device_capacity {
+            return Err(UbError::new(UB_ERR_NO_RESOURCES));
+        }
+        self.allocated.push((aligned, len));
+        Ok(aligned)
+    }
+
+    /// 释放区间（首版 no-op，接受碎片）
+    pub fn free(&mut self, _base: u64, _len: u64) {
+        // 首版不回收
+    }
+}
+```
+
+**首版策略**：纯 bump allocator，不回收。当 cursor 超出 device capacity 时返回 `UB_ERR_NO_RESOURCES`。
+
+**后续优化方向**：free-list / buddy allocator，在 NPU 大量 alloc/free 场景下减少碎片。
+
+### 17.18 PeerAddr 类型定义（补充 §9）
+
+```rust
+/// 网络地址，用于 Fabric 的 listen / dial
+#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+pub enum PeerAddr {
+    /// UDP / TCP 地址
+    Inet(SocketAddr),
+    /// Unix Domain Socket 路径
+    Unix(std::path::PathBuf),
+}
+```
+
+- UDP/TCP 使用 `Inet(SocketAddr)`，如 `127.0.0.1:7901`。
+- UDS 使用 `Unix(PathBuf)`，如 `/tmp/unibus_node0.sock`。
+- 控制面配置的 `listen` / `peers` 在解析时自动判断类型。
+
+### 17.19 安全边界补充（补充 §1, FR-ERR）
+
+需求文档 §7 明确安全假设："不面向不可信网络或恶意节点"。首版安全措施：
+
+| 措施 | 说明 |
+|---|---|
+| Magic 校验 | 帧头 Magic `0x55425459` 过滤非法包 |
+| Version 校验 | 版本不匹配丢弃 |
+| MR 权限检查 | 每次 verb 操作前校验 perms |
+| Offset 范围检查 | 每次访问前检查 `offset + len <= MR.len` |
+| Admin 绑定本机 | `/metrics` 和 `/admin` 默认 `127.0.0.1` |
+
+**不做的安全措施**（Toy 级别，生产级留扩展点）：
+- 不做消息认证码（MAC）或数字签名。
+- 不做加密（TLS/DTLS）。
+- 不做速率限制（rate limiting）。
+- 不做 NodeID 伪造检测——控制面信任所有合法连接的节点。
+
+### 17.20 日志规范（补充 §10）
+
+| 级别 | 使用场景 |
+|---|---|
+| ERROR | 不可恢复错误：session DEAD、MR 注销超时、fabric 连接失败 |
+| WARN | 可恢复异常：SACK 触发快速重传、重组超时、控制面 TCP 断连重连、版本不匹配 |
+| INFO | 关键事件：节点上线/下线、MR 注册/注销、Jetty 创建/销毁、会话建立/失效 |
+| DEBUG | 帧收发细节、ACK 确认、信用变化、WR/CQE 生命周期 |
+
+**结构化字段**（通过 `tracing::span` / `tracing::info!` 的 `target` / 字段）：
+- `node_id`：当前节点 ID
+- `peer`：对端节点 ID
+- `mr_handle`：MR 句柄
+- `jetty_id`：Jetty ID
+- `seq`：StreamSeq
+- `wr_id`：Work Request ID
+
+日志默认级别 INFO，可通过配置 `log_level: debug` 调整。
