@@ -797,14 +797,20 @@ flowchart TD
 
 ```mermaid
 stateDiagram-v2
-  [*] --> "Joining": 启动, 向 seed/hub 发起连接
-  "Joining" --> "Active": HELLO 交换完成, MEMBER_UP 广播
-  "Active" --> "Leaving": 主动 shutdown
-  "Active" -> "Suspect": 连续 N 次心跳丢失
-  "Suspect" -> "Active": 收到心跳恢复
-  "Suspect" --> "Down": 心跳超时确认
-  "Leaving" --> "Down": 广播 MEMBER_DOWN 完成
-  "Down" --> [*]
+  state "Joining (启动中)" as Joining
+  state "Active (活跃)" as Active
+  state "Leaving (离开中)" as Leaving
+  state "Suspect (疑似离线)" as Suspect
+  state "Down (已下线)" as Down
+
+  [*] --> Joining: 启动, 向 seed/hub 发起连接
+  Joining --> Active: HELLO 交换完成, MEMBER_UP 广播
+  Active --> Leaving: 主动 shutdown
+  Active --> Suspect: 连续 N 次心跳丢失
+  Suspect --> Active: 收到心跳恢复
+  Suspect --> Down: 心跳超时确认
+  Leaving --> Down: 广播 MEMBER_DOWN 完成
+  Down --> [*]
 ```
 
 **状态说明**：
