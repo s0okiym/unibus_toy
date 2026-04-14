@@ -13,7 +13,7 @@ use ub_core::config::NodeConfig;
 use ub_core::device::memory::MemoryDevice;
 use ub_core::device::Device;
 use ub_core::mr::{MrCacheTable, MrTable};
-use ub_core::types::MrPerms;
+use ub_core::types::{JettyAddr, MrPerms};
 use ub_dataplane::DataPlaneEngine;
 use ub_fabric::udp::UdpFabric;
 
@@ -31,6 +31,7 @@ struct AppState {
     config: Arc<NodeConfig>,
     mr_table: Arc<MrTable>,
     mr_cache: Arc<MrCacheTable>,
+    jetty_table: Arc<ub_core::jetty::JettyTable>,
     dataplane: Arc<tokio::sync::Mutex<DataPlaneEngine>>,
 }
 
@@ -69,6 +70,34 @@ struct VerbAtomicCasRequest {
 struct VerbAtomicFaaRequest {
     ub_addr: String,
     add: u64,
+}
+
+#[derive(Deserialize)]
+struct JettyPostRecvRequest {
+    jetty_handle: u32,
+    len: u32,
+}
+
+#[derive(Deserialize)]
+struct JettyPollCqeRequest {
+    jetty_handle: u32,
+}
+
+#[derive(Deserialize)]
+struct VerbSendRequest {
+    dst_node_id: u16,
+    dst_jetty_id: u32,
+    data: Vec<u8>,
+    imm: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct VerbWriteImmRequest {
+    ub_addr: String,
+    data: Vec<u8>,
+    imm: u64,
+    dst_node_id: u16,
+    dst_jetty_id: u32,
 }
 
 fn parse_ub_addr(s: &str) -> Result<UbAddr, String> {
@@ -113,10 +142,12 @@ async fn main() {
     let data_listen: std::net::SocketAddr = config.data.listen.parse()
         .expect("invalid data listen address");
     let fabric = Arc::new(UdpFabric::bind(data_listen).await.expect("failed to bind data plane UDP socket"));
+    let jetty_table = Arc::new(ub_core::jetty::JettyTable::new(config.node_id, config.jetty.clone()));
     let mut dataplane = DataPlaneEngine::new(
         config.node_id,
         Arc::clone(&mr_table),
         Arc::clone(&mr_cache),
+        Arc::clone(&jetty_table),
         fabric,
     );
     dataplane.start().await.expect("failed to start data plane");
@@ -151,6 +182,7 @@ async fn main() {
         config: Arc::clone(&config),
         mr_table: Arc::clone(&mr_table),
         mr_cache: Arc::clone(&mr_cache),
+        jetty_table: Arc::clone(&jetty_table),
         dataplane,
     });
 
@@ -161,10 +193,17 @@ async fn main() {
         .route("/admin/mr/cache", get(mr_cache_list))
         .route("/admin/mr/register", post(mr_register))
         .route("/admin/mr/deregister", post(mr_deregister))
+        .route("/admin/jetty/create", post(jetty_create))
+        .route("/admin/jetty/list", get(jetty_list))
+        .route("/admin/jetty/post-recv", post(jetty_post_recv))
+        .route("/admin/jetty/poll-cqe", post(jetty_poll_cqe))
         .route("/admin/verb/write", post(verb_write))
         .route("/admin/verb/read", post(verb_read))
         .route("/admin/verb/atomic-cas", post(verb_atomic_cas))
         .route("/admin/verb/atomic-faa", post(verb_atomic_faa))
+        .route("/admin/verb/send", post(verb_send))
+        .route("/admin/verb/send-with-imm", post(verb_send_with_imm))
+        .route("/admin/verb/write-imm", post(verb_write_imm))
         .with_state(state);
 
     let metrics_addr: std::net::SocketAddr = config.obs.metrics_listen.parse()
@@ -339,6 +378,138 @@ async fn verb_atomic_faa(
     let dp = state.dataplane.lock().await;
     match dp.ub_atomic_faa_remote(addr, req.add).await {
         Ok(old_value) => Json(json!({"old_value": old_value})),
+        Err(e) => Json(json!({"error": format!("{}", e)})),
+    }
+}
+
+async fn jetty_create(State(state): State<Arc<AppState>>) -> Json<Value> {
+    match state.jetty_table.create() {
+        Ok(handle) => Json(json!({"jetty_handle": handle.0})),
+        Err(e) => Json(json!({"error": format!("{}", e)})),
+    }
+}
+
+async fn jetty_list(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let infos = state.jetty_table.list();
+    let list: Vec<Value> = infos.iter().map(|j| {
+        json!({
+            "handle": j.handle.0,
+            "node_id": j.node_id,
+            "jfs_depth": j.jfs_depth,
+            "jfr_depth": j.jfr_depth,
+            "jfc_depth": j.jfc_depth,
+            "jfc_high_watermark": j.jfc_high_watermark,
+            "cqe_count": j.cqe_count,
+            "jfs_count": j.jfs_count,
+            "jfr_count": j.jfr_count,
+        })
+    }).collect();
+    Json(json!({ "jettys": list }))
+}
+
+async fn jetty_post_recv(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JettyPostRecvRequest>,
+) -> Json<Value> {
+    let jetty = match state.jetty_table.lookup(req.jetty_handle) {
+        Some(j) => j,
+        None => return Json(json!({"error": "jetty not found"})),
+    };
+
+    let buf = vec![0u8; req.len as usize];
+    let wr_id = req.jetty_handle as u64; // simple wr_id assignment
+    match jetty.post_recv(buf, wr_id) {
+        Ok(()) => Json(json!({"status": "ok"})),
+        Err(e) => Json(json!({"error": format!("{}", e)})),
+    }
+}
+
+async fn jetty_poll_cqe(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<JettyPollCqeRequest>,
+) -> Json<Value> {
+    let jetty = match state.jetty_table.lookup(req.jetty_handle) {
+        Some(j) => j,
+        None => return Json(json!({"error": "jetty not found"})),
+    };
+
+    match jetty.poll_cqe() {
+        Some(cqe) => Json(json!({
+            "wr_id": cqe.wr_id,
+            "status": cqe.status,
+            "imm": cqe.imm,
+            "byte_len": cqe.byte_len,
+            "jetty_id": cqe.jetty_id,
+            "verb": format!("{:?}", cqe.verb),
+        })),
+        None => Json(json!({"cqe": null})),
+    }
+}
+
+async fn verb_send(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerbSendRequest>,
+) -> Json<Value> {
+    let dst_jetty = JettyAddr {
+        node_id: req.dst_node_id,
+        jetty_id: req.dst_jetty_id,
+    };
+
+    // Use default jetty (handle=1) if it exists, otherwise 0
+    let src_jetty_id = state.jetty_table.list().first()
+        .map(|j| j.handle.0)
+        .unwrap_or(0);
+
+    let dp = state.dataplane.lock().await;
+    match dp.ub_send_remote(src_jetty_id, dst_jetty, &req.data).await {
+        Ok(()) => Json(json!({"status": "ok"})),
+        Err(e) => Json(json!({"error": format!("{}", e)})),
+    }
+}
+
+async fn verb_send_with_imm(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerbSendRequest>,
+) -> Json<Value> {
+    let dst_jetty = JettyAddr {
+        node_id: req.dst_node_id,
+        jetty_id: req.dst_jetty_id,
+    };
+
+    let imm = req.imm.unwrap_or(0);
+
+    let src_jetty_id = state.jetty_table.list().first()
+        .map(|j| j.handle.0)
+        .unwrap_or(0);
+
+    let dp = state.dataplane.lock().await;
+    match dp.ub_send_with_imm_remote(src_jetty_id, dst_jetty, &req.data, imm).await {
+        Ok(()) => Json(json!({"status": "ok"})),
+        Err(e) => Json(json!({"error": format!("{}", e)})),
+    }
+}
+
+async fn verb_write_imm(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerbWriteImmRequest>,
+) -> Json<Value> {
+    let addr = match parse_ub_addr(&req.ub_addr) {
+        Ok(a) => a,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let dst_jetty = JettyAddr {
+        node_id: req.dst_node_id,
+        jetty_id: req.dst_jetty_id,
+    };
+
+    let src_jetty_id = state.jetty_table.list().first()
+        .map(|j| j.handle.0)
+        .unwrap_or(0);
+
+    let dp = state.dataplane.lock().await;
+    match dp.ub_write_imm_remote(addr, &req.data, req.imm, src_jetty_id, dst_jetty).await {
+        Ok(()) => Json(json!({"status": "ok"})),
         Err(e) => Json(json!({"error": format!("{}", e)})),
     }
 }

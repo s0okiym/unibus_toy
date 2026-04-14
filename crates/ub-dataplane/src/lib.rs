@@ -15,8 +15,9 @@ use ub_wire::frame::*;
 
 use ub_core::addr::UbAddr;
 use ub_core::error::UbError;
+use ub_core::jetty::JettyTable;
 use ub_core::mr::{MrCacheTable, MrTable};
-use ub_core::types::Verb;
+use ub_core::types::{JettyAddr, Verb};
 
 /// Maximum payload size for M2 (no fragmentation).
 pub const MAX_PAYLOAD_SIZE: usize = 1320; // 1400 PMTU - 80 bytes header
@@ -36,6 +37,7 @@ pub struct DataPlaneEngine {
     local_node_id: u16,
     mr_table: Arc<MrTable>,
     mr_cache: Arc<MrCacheTable>,
+    jetty_table: Arc<JettyTable>,
     fabric: Arc<UdpFabric>,
     pending_requests: Arc<DashMap<u64, oneshot::Sender<VerbResponse>>>,
     next_opaque: Arc<AtomicU64>,
@@ -50,6 +52,7 @@ impl Clone for DataPlaneEngine {
             local_node_id: self.local_node_id,
             mr_table: Arc::clone(&self.mr_table),
             mr_cache: Arc::clone(&self.mr_cache),
+            jetty_table: Arc::clone(&self.jetty_table),
             fabric: Arc::clone(&self.fabric),
             pending_requests: Arc::clone(&self.pending_requests),
             next_opaque: Arc::clone(&self.next_opaque),
@@ -64,12 +67,14 @@ impl DataPlaneEngine {
         local_node_id: u16,
         mr_table: Arc<MrTable>,
         mr_cache: Arc<MrCacheTable>,
+        jetty_table: Arc<JettyTable>,
         fabric: Arc<UdpFabric>,
     ) -> Self {
         DataPlaneEngine {
             local_node_id,
             mr_table,
             mr_cache,
+            jetty_table,
             fabric,
             pending_requests: Arc::new(DashMap::new()),
             next_opaque: Arc::new(AtomicU64::new(1)),
@@ -84,6 +89,7 @@ impl DataPlaneEngine {
 
         let mr_table = Arc::clone(&self.mr_table);
         let mr_cache = Arc::clone(&self.mr_cache);
+        let jetty_table = Arc::clone(&self.jetty_table);
         let pending = Arc::clone(&self.pending_requests);
         let local_node_id = self.local_node_id;
         let fabric = Arc::clone(&self.fabric);
@@ -94,6 +100,7 @@ impl DataPlaneEngine {
                     Ok(mut session) => {
                         let mr_table = Arc::clone(&mr_table);
                         let mr_cache = Arc::clone(&mr_cache);
+                        let jetty_table = Arc::clone(&jetty_table);
                         let pending = Arc::clone(&pending);
                         let local_node_id = local_node_id;
                         let fabric = Arc::clone(&fabric);
@@ -103,7 +110,7 @@ impl DataPlaneEngine {
                                 match session.recv().await {
                                     Ok(raw_frame) => {
                                         handle_incoming_frame(
-                                            &raw_frame, &mr_table, &mr_cache, &pending,
+                                            &raw_frame, &mr_table, &mr_cache, &jetty_table, &pending,
                                             &mut session, local_node_id, &fabric,
                                         ).await;
                                     }
@@ -335,8 +342,114 @@ impl DataPlaneEngine {
         }
     }
 
+    /// Remote send (fire-and-forget, bilateral message).
+    pub async fn ub_send_remote(
+        &self,
+        jetty_src: u32,
+        dst_jetty: JettyAddr,
+        data: &[u8],
+    ) -> Result<(), UbError> {
+        if data.len() > MAX_PAYLOAD_SIZE {
+            return Err(UbError::PayloadTooLarge);
+        }
+
+        let sender = self.peer_senders.get(&dst_jetty.node_id)
+            .ok_or(UbError::LinkDown)?;
+
+        let frame = build_data_frame_ex(
+            self.local_node_id,
+            dst_jetty.node_id,
+            Verb::Send,
+            0, // no MR handle
+            UbAddr::new(0, 0, 0, 0, 0), // no UB address
+            0, // no opaque
+            jetty_src,
+            dst_jetty.jetty_id,
+            None, // no imm
+            data,
+        );
+
+        sender.send(frame.to_vec()).await
+            .map_err(|_| UbError::LinkDown)?;
+        Ok(())
+    }
+
+    /// Remote send with immediate (fire-and-forget, bilateral message + imm).
+    pub async fn ub_send_with_imm_remote(
+        &self,
+        jetty_src: u32,
+        dst_jetty: JettyAddr,
+        data: &[u8],
+        imm: u64,
+    ) -> Result<(), UbError> {
+        if data.len() > MAX_PAYLOAD_SIZE {
+            return Err(UbError::PayloadTooLarge);
+        }
+
+        let sender = self.peer_senders.get(&dst_jetty.node_id)
+            .ok_or(UbError::LinkDown)?;
+
+        let frame = build_data_frame_ex(
+            self.local_node_id,
+            dst_jetty.node_id,
+            Verb::Send,
+            0,
+            UbAddr::new(0, 0, 0, 0, 0),
+            0,
+            jetty_src,
+            dst_jetty.jetty_id,
+            Some(imm),
+            data,
+        );
+
+        sender.send(frame.to_vec()).await
+            .map_err(|_| UbError::LinkDown)?;
+        Ok(())
+    }
+
+    /// Remote write with immediate (fire-and-forget, unilateral write + JFC CQE notification).
+    pub async fn ub_write_imm_remote(
+        &self,
+        addr: UbAddr,
+        data: &[u8],
+        imm: u64,
+        jetty_src: u32,
+        dst_jetty: JettyAddr,
+    ) -> Result<(), UbError> {
+        if data.len() > MAX_PAYLOAD_SIZE {
+            return Err(UbError::PayloadTooLarge);
+        }
+
+        let cache_entry = self.mr_cache.lookup_by_addr(addr)
+            .ok_or(UbError::AddrInvalid)?;
+
+        let sender = self.peer_senders.get(&cache_entry.owner_node)
+            .ok_or(UbError::LinkDown)?;
+
+        let frame = build_data_frame_ex(
+            self.local_node_id,
+            cache_entry.owner_node,
+            Verb::WriteImm,
+            cache_entry.remote_mr_handle,
+            addr,
+            0,
+            jetty_src,
+            dst_jetty.jetty_id,
+            Some(imm),
+            data,
+        );
+
+        sender.send(frame.to_vec()).await
+            .map_err(|_| UbError::LinkDown)?;
+        Ok(())
+    }
+
     pub fn fabric(&self) -> &Arc<UdpFabric> {
         &self.fabric
+    }
+
+    pub fn jetty_table(&self) -> &Arc<JettyTable> {
+        &self.jetty_table
     }
 }
 
@@ -345,6 +458,7 @@ async fn handle_incoming_frame(
     raw: &[u8],
     mr_table: &MrTable,
     _mr_cache: &MrCacheTable,
+    jetty_table: &JettyTable,
     pending: &DashMap<u64, oneshot::Sender<VerbResponse>>,
     session: &mut Box<dyn Session>,
     local_node_id: u16,
@@ -365,12 +479,15 @@ async fn handle_incoming_frame(
                 Verb::AtomicFaa => {
                     handle_atomic_faa(payload, ext_header, mr_table, session, local_node_id, &header).await;
                 }
+                Verb::Send => {
+                    handle_send(payload, ext_header, jetty_table);
+                }
+                Verb::WriteImm => {
+                    handle_write_imm(payload, ext_header, mr_table, jetty_table);
+                }
                 // Response verbs — complete pending oneshot
                 Verb::ReadResp | Verb::AtomicCasResp | Verb::AtomicFaaResp => {
                     complete_pending_request(ext_header, payload, pending);
-                }
-                _ => {
-                    tracing::warn!("data plane: unhandled verb {:?}", ext_header.verb);
                 }
             }
         }
@@ -607,6 +724,102 @@ fn complete_pending_request(
     }
 }
 
+/// Handle incoming Send frame — match to a posted recv buffer and generate CQE.
+fn handle_send(
+    payload: &[u8],
+    ext: &DataExtHeader,
+    jetty_table: &JettyTable,
+) {
+    let jetty = match jetty_table.lookup(ext.jetty_dst) {
+        Some(j) => j,
+        None => {
+            tracing::warn!("SEND: jetty {} not found", ext.jetty_dst);
+            return;
+        }
+    };
+
+    // Pop a pre-posted receive buffer from JFR
+    let mut recv_buf = match jetty.pop_recv() {
+        Some(buf) => buf,
+        None => {
+            tracing::warn!("SEND: no recv buffer posted on jetty {}, dropping", ext.jetty_dst);
+            return;
+        }
+    };
+
+    // Copy payload into recv buffer (truncate if needed)
+    let copy_len = std::cmp::min(payload.len(), recv_buf.buf.len());
+    recv_buf.buf[..copy_len].copy_from_slice(&payload[..copy_len]);
+
+    // Push CQE onto JFC
+    let cqe = ub_core::types::Cqe {
+        wr_id: recv_buf.wr_id,
+        status: ub_core::error::UB_OK,
+        imm: ext.imm,
+        byte_len: copy_len as u32,
+        jetty_id: ext.jetty_dst,
+        verb: Verb::Send,
+    };
+    if let Err(e) = jetty.push_cqe(cqe) {
+        tracing::warn!("SEND: failed to push CQE to jetty {}: {e}", ext.jetty_dst);
+    }
+}
+
+/// Handle incoming WriteImm frame — write data to MR and generate CQE on target Jetty.
+fn handle_write_imm(
+    payload: &[u8],
+    ext: &DataExtHeader,
+    mr_table: &MrTable,
+    jetty_table: &JettyTable,
+) {
+    // Write payload to MR (same as handle_write)
+    let entry = match mr_table.lookup(ext.mr_handle) {
+        Some(e) => e,
+        None => {
+            tracing::warn!("WRITE_IMM: MR handle {} not found", ext.mr_handle);
+            return;
+        }
+    };
+
+    if let Err(e) = entry.check_perms(Verb::WriteImm) {
+        tracing::warn!("WRITE_IMM: permission denied for MR {}: {e}", ext.mr_handle);
+        return;
+    }
+
+    let offset_in_mr = if ext.ub_addr.offset() >= entry.base_ub_addr.offset() {
+        ext.ub_addr.offset() - entry.base_ub_addr.offset()
+    } else {
+        0
+    };
+    let device_offset = entry.base_offset + offset_in_mr;
+
+    if let Err(e) = entry.device.write(device_offset, payload) {
+        tracing::warn!("WRITE_IMM: device write error: {e}");
+        return;
+    }
+
+    // Generate CQE on target Jetty
+    let jetty = match jetty_table.lookup(ext.jetty_dst) {
+        Some(j) => j,
+        None => {
+            tracing::warn!("WRITE_IMM: jetty {} not found, write completed but no CQE", ext.jetty_dst);
+            return;
+        }
+    };
+
+    let cqe = ub_core::types::Cqe {
+        wr_id: 0,
+        status: ub_core::error::UB_OK,
+        imm: ext.imm,
+        byte_len: payload.len() as u32,
+        jetty_id: ext.jetty_dst,
+        verb: Verb::WriteImm,
+    };
+    if let Err(e) = jetty.push_cqe(cqe) {
+        tracing::warn!("WRITE_IMM: failed to push CQE to jetty {}: {e}", ext.jetty_dst);
+    }
+}
+
 async fn send_error_response(
     session: &mut Box<dyn Session>,
     local_node_id: u16,
@@ -683,6 +896,56 @@ fn build_data_frame_with_flags(
     encode_frame(&header, Some(&ext), payload)
 }
 
+/// Extended frame builder with Jetty and immediate value support.
+fn build_data_frame_ex(
+    src_node: u16,
+    dst_node: u16,
+    verb: Verb,
+    mr_handle: u32,
+    ub_addr: UbAddr,
+    opaque: u64,
+    jetty_src: u32,
+    jetty_dst: u32,
+    imm: Option<u64>,
+    payload: &[u8],
+) -> BytesMut {
+    let mut ext_flags = ExtFlags::empty();
+    let mut frame_flags = FrameFlags::empty();
+    if imm.is_some() {
+        ext_flags |= ExtFlags::HAS_IMM;
+        frame_flags |= FrameFlags::HAS_IMM;
+    }
+
+    let header = FrameHeader {
+        magic: MAGIC,
+        version: VERSION,
+        frame_type: FrameType::Data,
+        flags: frame_flags,
+        src_node,
+        dst_node,
+        reserved: 0,
+        stream_seq: 0,
+        payload_len: payload.len() as u32,
+        header_crc: 0,
+    };
+
+    let ext = DataExtHeader {
+        verb,
+        ext_flags,
+        mr_handle,
+        jetty_src,
+        jetty_dst,
+        opaque,
+        frag_id: 0,
+        frag_index: 0,
+        frag_total: 1,
+        ub_addr,
+        imm,
+    };
+
+    encode_frame(&header, Some(&ext), payload)
+}
+
 fn status_to_error(status: u32) -> UbError {
     match status {
         1 => UbError::AddrInvalid,
@@ -700,8 +963,19 @@ fn status_to_error(status: u32) -> UbError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ub_core::config::JettyConfig;
     use ub_core::device::memory::MemoryDevice;
+    use ub_core::jetty::JettyTable;
     use ub_core::types::{DeviceKind, MrPerms};
+
+    fn test_jetty_config() -> JettyConfig {
+        JettyConfig {
+            jfs_depth: 16,
+            jfr_depth: 16,
+            jfc_depth: 16,
+            jfc_high_watermark: 12,
+        }
+    }
 
     #[test]
     fn test_build_data_frame() {
@@ -747,8 +1021,8 @@ mod tests {
             device_kind: DeviceKind::Memory,
         });
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, fabric_b);
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
@@ -792,8 +1066,8 @@ mod tests {
             device_kind: DeviceKind::Memory,
         });
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, fabric_b);
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
@@ -844,8 +1118,8 @@ mod tests {
             device_kind: DeviceKind::Memory,
         });
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, fabric_b);
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
@@ -903,5 +1177,279 @@ mod tests {
             success_count <= 1,
             "At most one CAS should succeed with old=0 (got {success_count}, winner={winner_id})"
         );
+    }
+
+    #[test]
+    fn test_build_data_frame_ex_with_imm() {
+        let frame = build_data_frame_ex(
+            1, 2, Verb::Send, 0, UbAddr::new(0, 0, 0, 0, 0), 0,
+            10, 20, Some(42), &[1, 2, 3],
+        );
+        let (header, ext, payload) = decode_frame(&frame).unwrap();
+        assert_eq!(header.src_node, 1);
+        assert!(header.flags.contains(FrameFlags::HAS_IMM));
+        let ext = ext.unwrap();
+        assert_eq!(ext.verb, Verb::Send);
+        assert!(ext.ext_flags.contains(ExtFlags::HAS_IMM));
+        assert_eq!(ext.jetty_src, 10);
+        assert_eq!(ext.jetty_dst, 20);
+        assert_eq!(ext.imm, Some(42));
+        assert_eq!(payload, &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn test_dataplane_send_and_recv() {
+        let fabric_a = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let fabric_b = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+
+        let mr_table_a = Arc::new(MrTable::new(1, 1));
+        let mr_cache_a = Arc::new(MrCacheTable::new());
+        let mr_table_b = Arc::new(MrTable::new(1, 2));
+        let mr_cache_b = Arc::new(MrCacheTable::new());
+
+        let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
+        let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
+
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.start().await.unwrap();
+        engine_b.start().await.unwrap();
+
+        let addr_a_dp = engine_a.fabric.local_addr();
+        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Create Jetty on node A
+        let jetty_handle_a = jetty_table_a.create().unwrap();
+        let jetty_a = jetty_table_a.lookup(jetty_handle_a.0).unwrap();
+
+        // Post recv buffer on node A's Jetty
+        jetty_a.post_recv(vec![0u8; 256], 100).unwrap();
+
+        // Send from node B to node A's Jetty
+        let dst_jetty = JettyAddr { node_id: 1, jetty_id: jetty_handle_a.0 };
+        engine_b.ub_send_remote(1, dst_jetty, &[72, 101, 108, 108, 111]).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Poll CQE on node A
+        let cqe = jetty_a.poll_cqe();
+        assert!(cqe.is_some(), "Should have a CQE from the Send");
+        let cqe = cqe.unwrap();
+        assert_eq!(cqe.wr_id, 100);
+        assert_eq!(cqe.byte_len, 5);
+        assert_eq!(cqe.verb, Verb::Send);
+        assert_eq!(cqe.imm, None);
+    }
+
+    #[tokio::test]
+    async fn test_dataplane_send_with_imm() {
+        let fabric_a = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let fabric_b = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+
+        let mr_table_a = Arc::new(MrTable::new(1, 1));
+        let mr_cache_a = Arc::new(MrCacheTable::new());
+        let mr_table_b = Arc::new(MrTable::new(1, 2));
+        let mr_cache_b = Arc::new(MrCacheTable::new());
+
+        let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
+        let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
+
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.start().await.unwrap();
+        engine_b.start().await.unwrap();
+
+        let addr_a_dp = engine_a.fabric.local_addr();
+        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let jetty_handle_a = jetty_table_a.create().unwrap();
+        let jetty_a = jetty_table_a.lookup(jetty_handle_a.0).unwrap();
+        jetty_a.post_recv(vec![0u8; 256], 200).unwrap();
+
+        let dst_jetty = JettyAddr { node_id: 1, jetty_id: jetty_handle_a.0 };
+        engine_b.ub_send_with_imm_remote(1, dst_jetty, &[1, 2, 3], 42).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let cqe = jetty_a.poll_cqe().unwrap();
+        assert_eq!(cqe.wr_id, 200);
+        assert_eq!(cqe.imm, Some(42));
+        assert_eq!(cqe.byte_len, 3);
+    }
+
+    #[tokio::test]
+    async fn test_dataplane_write_imm() {
+        let fabric_a = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let fabric_b = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+
+        let mr_table_a = Arc::new(MrTable::new(1, 1));
+        let mr_cache_a = Arc::new(MrCacheTable::new());
+        let mr_table_b = Arc::new(MrTable::new(1, 2));
+        let mr_cache_b = Arc::new(MrCacheTable::new());
+
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (addr_a, handle_a) = mr_table_a.register(dev, 4096, MrPerms::READ | MrPerms::WRITE).unwrap();
+
+        mr_cache_b.insert(ub_core::mr::MrCacheEntry {
+            remote_mr_handle: handle_a.0,
+            owner_node: 1,
+            base_ub_addr: addr_a,
+            len: 4096,
+            perms: MrPerms::READ | MrPerms::WRITE,
+            device_kind: DeviceKind::Memory,
+        });
+
+        let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
+        let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
+
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.start().await.unwrap();
+        engine_b.start().await.unwrap();
+
+        let addr_a_dp = engine_a.fabric.local_addr();
+        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Create Jetty on node A for CQE notification
+        let jetty_handle_a = jetty_table_a.create().unwrap();
+        let jetty_a = jetty_table_a.lookup(jetty_handle_a.0).unwrap();
+
+        // Write_imm from B to A's MR, notify A's Jetty with imm=42
+        let dst_jetty = JettyAddr { node_id: 1, jetty_id: jetty_handle_a.0 };
+        engine_b.ub_write_imm_remote(addr_a, &[0xDE, 0xAD, 0xBE, 0xEF], 42, 1, dst_jetty).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Verify MR was written
+        let entry = mr_table_a.lookup(handle_a.0).unwrap();
+        let mut buf = [0u8; 4];
+        entry.device.read(entry.base_offset, &mut buf).unwrap();
+        assert_eq!(&buf, &[0xDE, 0xAD, 0xBE, 0xEF]);
+
+        // Verify CQE on node A's Jetty
+        let cqe = jetty_a.poll_cqe().unwrap();
+        assert_eq!(cqe.imm, Some(42));
+        assert_eq!(cqe.verb, Verb::WriteImm);
+        assert_eq!(cqe.byte_len, 4);
+    }
+
+    /// Test that two sends on the same (src_jetty, dst_jetty) pair arrive in order.
+    #[tokio::test]
+    async fn test_message_ordering_same_jetty_pair() {
+        let fabric_a = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let fabric_b = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+
+        let mr_table_a = Arc::new(MrTable::new(1, 1));
+        let mr_cache_a = Arc::new(MrCacheTable::new());
+        let mr_table_b = Arc::new(MrTable::new(1, 2));
+        let mr_cache_b = Arc::new(MrCacheTable::new());
+
+        let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
+        let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
+
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.start().await.unwrap();
+        engine_b.start().await.unwrap();
+
+        let addr_a_dp = engine_a.fabric.local_addr();
+        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Create Jetty on A, post 2 recv buffers
+        let jetty_handle_a = jetty_table_a.create().unwrap();
+        let jetty_a = jetty_table_a.lookup(jetty_handle_a.0).unwrap();
+
+        // Post recv with different wr_ids so we can identify ordering
+        jetty_a.post_recv(vec![0u8; 64], 100).unwrap(); // first recv
+        jetty_a.post_recv(vec![0u8; 64], 101).unwrap(); // second recv
+
+        // Create Jetty on B for src
+        let jetty_handle_b = jetty_table_b.create().unwrap();
+
+        let dst_jetty = JettyAddr { node_id: 1, jetty_id: jetty_handle_a.0 };
+
+        // Send message 1 then message 2
+        engine_b.ub_send_remote(jetty_handle_b.0, dst_jetty, &[1]).await.unwrap();
+        engine_b.ub_send_remote(jetty_handle_b.0, dst_jetty, &[2]).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // First CQE should be for wr_id=100, second for wr_id=101
+        let cqe1 = jetty_a.poll_cqe().expect("first CQE");
+        let cqe2 = jetty_a.poll_cqe().expect("second CQE");
+
+        assert_eq!(cqe1.wr_id, 100, "first CQE should match first recv buffer");
+        assert_eq!(cqe2.wr_id, 101, "second CQE should match second recv buffer");
+    }
+
+    /// Test concurrent sends from multiple tasks to the same Jetty.
+    #[tokio::test]
+    async fn test_concurrent_sends_same_jetty() {
+        let fabric_a = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+        let fabric_b = Arc::new(UdpFabric::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+
+        let mr_table_a = Arc::new(MrTable::new(1, 1));
+        let mr_cache_a = Arc::new(MrCacheTable::new());
+        let mr_table_b = Arc::new(MrTable::new(1, 2));
+        let mr_cache_b = Arc::new(MrCacheTable::new());
+
+        let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
+        let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
+
+        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.start().await.unwrap();
+        engine_b.start().await.unwrap();
+
+        let addr_a_dp = engine_a.fabric.local_addr();
+        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Create Jetty on A, post 4 recv buffers
+        let jetty_handle_a = jetty_table_a.create().unwrap();
+        let jetty_a = jetty_table_a.lookup(jetty_handle_a.0).unwrap();
+        for i in 0..4u64 {
+            jetty_a.post_recv(vec![0u8; 64], 200 + i).unwrap();
+        }
+
+        let jetty_handle_b = jetty_table_b.create().unwrap();
+        let dst_jetty = JettyAddr { node_id: 1, jetty_id: jetty_handle_a.0 };
+
+        // Send 4 messages concurrently from B
+        let mut handles = Vec::new();
+        for i in 0..4u8 {
+            let engine = engine_b.clone();
+            let dst = dst_jetty;
+            handles.push(tokio::spawn(async move {
+                engine.ub_send_remote(1, dst, &[i]).await
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // All 4 CQEs should eventually arrive
+        let mut cqe_count = 0;
+        while jetty_a.poll_cqe().is_some() {
+            cqe_count += 1;
+        }
+        assert_eq!(cqe_count, 4, "all 4 concurrent sends should produce CQEs");
     }
 }

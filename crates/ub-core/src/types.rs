@@ -16,7 +16,7 @@ bitflags! {
 pub struct MrHandle(pub u32);
 
 /// Jetty handle — local identifier within a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct JettyHandle(pub u32);
 
 /// Jetty address — globally unique across the SuperPod.
