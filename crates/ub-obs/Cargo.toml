@@ -1,0 +1,13 @@
+[package]
+name = "ub-obs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ub-core = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "ub-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+bitflags = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+rand = { workspace = true }

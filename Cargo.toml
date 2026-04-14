@@ -1,0 +1,69 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ub-core",
+    "crates/ub-wire",
+    "crates/ub-transport",
+    "crates/ub-control",
+    "crates/ub-fabric",
+    "crates/ub-obs",
+    "crates/ub-managed",
+    "crates/unibusd",
+    "crates/unibusctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Buffer / codec
+bytes = "1"
+byteorder = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Concurrency primitives
+parking_lot = "0.12"
+dashmap = "6"
+crossbeam = "0.8"
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+
+# Logging / tracing / metrics
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# HTTP
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Random
+rand = "0.9"
+
+# Bitflags
+bitflags = "2"
+
+# Internal crates
+ub-core = { path = "crates/ub-core" }
+ub-wire = { path = "crates/ub-wire" }
+ub-transport = { path = "crates/ub-transport" }
+ub-control = { path = "crates/ub-control" }
+ub-fabric = { path = "crates/ub-fabric" }
+ub-obs = { path = "crates/ub-obs" }
+ub-managed = { path = "crates/ub-managed" }

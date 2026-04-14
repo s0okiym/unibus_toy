@@ -1,0 +1,16 @@
+[package]
+name = "unibusctl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "unibusctl"
+path = "src/main.rs"
+
+[dependencies]
+ub-core = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }

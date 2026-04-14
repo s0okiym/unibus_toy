@@ -1,0 +1,35 @@
+pod_id: 1
+node_id: 2
+control:
+  listen: "0.0.0.0:7901"
+  bootstrap: static
+  peers:
+    - "127.0.0.1:7900"
+  hub_node_id: 0
+data:
+  listen: "0.0.0.0:7911"
+  fabric: udp
+  mtu: 1400
+mr:
+  deregister_timeout_ms: 500
+device:
+  npu:
+    enabled: true
+    mem_size_mib: 64
+transport:
+  rto_ms: 200
+  max_retries: 8
+flow:
+  initial_credits: 64
+jetty:
+  jfs_depth: 1024
+  jfr_depth: 1024
+  jfc_depth: 1024
+  jfc_high_watermark: 896
+obs:
+  metrics_listen: "127.0.0.1:9091"
+heartbeat:
+  interval_ms: 1000
+  fail_after: 3
+managed:
+  enabled: false

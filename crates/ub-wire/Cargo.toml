@@ -1,0 +1,11 @@
+[package]
+name = "ub-wire"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ub-core = { workspace = true }
+thiserror = { workspace = true }
+byteorder = { workspace = true }
+bytes = { workspace = true }
+bitflags = { workspace = true }

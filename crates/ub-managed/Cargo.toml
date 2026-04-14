@@ -1,0 +1,10 @@
+[package]
+name = "ub-managed"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ub-core = { workspace = true }
+ub-control = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

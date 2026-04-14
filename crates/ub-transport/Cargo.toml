@@ -1,0 +1,13 @@
+[package]
+name = "ub-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ub-core = { workspace = true }
+ub-wire = { workspace = true }
+ub-fabric = { workspace = true }
+ub-obs = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }

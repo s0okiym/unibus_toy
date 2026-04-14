@@ -11,13 +11,9 @@ Thumbs.db
 /bin/
 /dist/
 /build/
+/target/
 *.exe
 *.out
-
-# Go
-/vendor/
-*.test
-coverage.out
 
 # Logs
 *.log
