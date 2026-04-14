@@ -8,6 +8,7 @@ members = [
     "crates/ub-fabric",
     "crates/ub-obs",
     "crates/ub-managed",
+    "crates/ub-dataplane",
     "crates/unibusd",
     "crates/unibusctl",
 ]
@@ -67,3 +68,4 @@ ub-control = { path = "crates/ub-control" }
 ub-fabric = { path = "crates/ub-fabric" }
 ub-obs = { path = "crates/ub-obs" }
 ub-managed = { path = "crates/ub-managed" }
+ub-dataplane = { path = "crates/ub-dataplane" }

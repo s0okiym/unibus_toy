@@ -1,0 +1,16 @@
+[package]
+name = "ub-dataplane"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ub-core = { workspace = true }
+ub-wire = { workspace = true }
+ub-fabric = { workspace = true }
+ub-control = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+byteorder = { workspace = true }

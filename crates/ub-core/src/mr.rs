@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 
 use crate::addr::UbAddr;
 use crate::device::Device;
@@ -57,7 +58,7 @@ impl MrEntry {
         let required = match verb {
             Verb::ReadReq | Verb::ReadResp => MrPerms::READ,
             Verb::Write | Verb::WriteImm => MrPerms::WRITE,
-            Verb::AtomicCas | Verb::AtomicFaa => MrPerms::ATOMIC,
+            Verb::AtomicCas | Verb::AtomicFaa | Verb::AtomicCasResp | Verb::AtomicFaaResp => MrPerms::ATOMIC,
             Verb::Send => MrPerms::WRITE, // Send requires WRITE permission
         };
         if self.perms.contains(required) {
@@ -66,6 +67,24 @@ impl MrEntry {
             Err(UbError::PermDenied)
         }
     }
+}
+
+/// Event emitted by MrTable when an MR is registered or deregistered.
+/// Consumed by the control plane to broadcast MR_PUBLISH/MR_REVOKE.
+#[derive(Debug, Clone)]
+pub struct MrPublishInfo {
+    pub mr_handle: u32,
+    pub owner_node: u16,
+    pub base_ub_addr: UbAddr,
+    pub len: u64,
+    pub perms: MrPerms,
+    pub device_kind: DeviceKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum MrPublishEvent {
+    Publish(MrPublishInfo),
+    Revoke { owner_node: u16, mr_handle: u32 },
 }
 
 /// Bump allocator for offset space within a device.
@@ -92,6 +111,8 @@ pub struct MrTable {
     offset_allocators: Mutex<DashMap<u16, OffsetAllocator>>,
     pod_id: u16,
     node_id: u16,
+    /// Optional channel to notify control plane of MR registration/deregistration.
+    publish_tx: Option<mpsc::UnboundedSender<MrPublishEvent>>,
 }
 
 impl MrTable {
@@ -106,7 +127,17 @@ impl MrTable {
             offset_allocators: Mutex::new(allocators),
             pod_id,
             node_id,
+            publish_tx: None,
         }
+    }
+
+    /// Create MrTable with a channel for MR publish events.
+    /// Returns (MrTable, mpsc::UnboundedReceiver<MrPublishEvent>).
+    pub fn new_with_channel(pod_id: u16, node_id: u16) -> (Self, mpsc::UnboundedReceiver<MrPublishEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut table = Self::new(pod_id, node_id);
+        table.publish_tx = Some(tx);
+        (table, rx)
     }
 
     /// Register a new MR. Returns (UbAddr, MrHandle).
@@ -141,6 +172,8 @@ impl MrTable {
 
         let base_ub_addr = UbAddr::new(self.pod_id, self.node_id, device_id, offset, 0);
 
+        let device_kind = device.kind();
+
         let entry = Arc::new(MrEntry {
             handle,
             device,
@@ -153,6 +186,19 @@ impl MrTable {
         });
 
         self.entries.insert(handle, entry);
+
+        // Notify control plane about the new MR
+        if let Some(ref tx) = self.publish_tx {
+            let _ = tx.send(MrPublishEvent::Publish(MrPublishInfo {
+                mr_handle: handle,
+                owner_node: self.node_id,
+                base_ub_addr,
+                len,
+                perms,
+                device_kind,
+            }));
+        }
+
         Ok((base_ub_addr, MrHandle(handle)))
     }
 
@@ -163,6 +209,15 @@ impl MrTable {
         if entry.is_none() {
             return Err(UbError::AddrInvalid);
         }
+
+        // Notify control plane about the MR removal
+        if let Some(ref tx) = self.publish_tx {
+            let _ = tx.send(MrPublishEvent::Revoke {
+                owner_node: self.node_id,
+                mr_handle: handle.0,
+            });
+        }
+
         Ok(())
     }
 
@@ -390,5 +445,56 @@ mod tests {
 
         cache.remove(10, 1);
         assert!(cache.lookup_by_addr(addr.with_offset(100)).is_none());
+    }
+
+    #[test]
+    fn test_mr_publish_event_on_register() {
+        let (table, mut rx) = MrTable::new_with_channel(1, 42);
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (addr, handle) = table.register(dev, 1024, MrPerms::READ | MrPerms::WRITE).unwrap();
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            MrPublishEvent::Publish(info) => {
+                assert_eq!(info.mr_handle, handle.0);
+                assert_eq!(info.owner_node, 42);
+                assert_eq!(info.base_ub_addr, addr);
+                assert_eq!(info.len, 1024);
+                assert_eq!(info.perms, MrPerms::READ | MrPerms::WRITE);
+                assert_eq!(info.device_kind, DeviceKind::Memory);
+            }
+            MrPublishEvent::Revoke { .. } => panic!("expected Publish event"),
+        }
+    }
+
+    #[test]
+    fn test_mr_publish_event_on_deregister() {
+        let (table, mut rx) = MrTable::new_with_channel(1, 42);
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (_, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
+
+        // Drain the Publish event
+        let _ = rx.try_recv().unwrap();
+
+        table.deregister(handle).unwrap();
+        let event = rx.try_recv().unwrap();
+        match event {
+            MrPublishEvent::Revoke { owner_node, mr_handle } => {
+                assert_eq!(owner_node, 42);
+                assert_eq!(mr_handle, handle.0);
+            }
+            MrPublishEvent::Publish(_) => panic!("expected Revoke event"),
+        }
+    }
+
+    #[test]
+    fn test_mr_table_without_channel_works() {
+        // MrTable without channel should work exactly as before
+        let table = MrTable::new(1, 42);
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (addr, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
+        assert!(table.lookup(handle.0).is_some());
+        table.deregister(handle).unwrap();
+        assert!(table.lookup(handle.0).is_none());
     }
 }

@@ -40,6 +40,8 @@ pub enum Verb {
     AtomicFaa = 5,
     Send = 6,
     WriteImm = 7,
+    AtomicCasResp = 8,
+    AtomicFaaResp = 9,
 }
 
 impl Verb {
@@ -52,6 +54,8 @@ impl Verb {
             5 => Some(Verb::AtomicFaa),
             6 => Some(Verb::Send),
             7 => Some(Verb::WriteImm),
+            8 => Some(Verb::AtomicCasResp),
+            9 => Some(Verb::AtomicFaaResp),
             _ => None,
         }
     }
@@ -137,12 +141,12 @@ mod tests {
 
     #[test]
     fn test_verb_roundtrip() {
-        for v in 1u8..=7u8 {
+        for v in 1u8..=9u8 {
             let verb = Verb::from_u8(v).unwrap();
             assert_eq!(verb as u8, v);
         }
         assert!(Verb::from_u8(0).is_none());
-        assert!(Verb::from_u8(8).is_none());
+        assert!(Verb::from_u8(10).is_none());
     }
 
     #[test]

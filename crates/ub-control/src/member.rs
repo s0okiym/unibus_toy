@@ -96,7 +96,7 @@ impl MemberTable {
             .collect()
     }
 
-    /// Get all node info (for admin API).
+    /// Get all node info (for admin API). Strips tx channels.
     pub fn list(&self) -> Vec<NodeInfo> {
         let nodes = self.nodes.read();
         nodes.iter().map(|n: &NodeInfo| {
@@ -104,6 +104,15 @@ impl MemberTable {
             info.tx = None;
             info
         }).collect()
+    }
+
+    /// Get all active peer senders (for internal broadcast).
+    pub fn active_peer_senders(&self) -> Vec<(u16, mpsc::Sender<Vec<u8>>)> {
+        let nodes = self.nodes.read();
+        nodes.iter()
+            .filter(|n| n.node_id != self.local_node_id && n.state != NodeState::Down)
+            .filter_map(|n| n.tx.clone().map(|tx| (n.node_id, tx)))
+            .collect()
     }
 
     /// Get node info by ID.

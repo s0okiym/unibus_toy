@@ -1901,6 +1901,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ub-dataplane"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "byteorder",
+ "bytes",
+ "dashmap",
+ "tokio",
+ "tracing",
+ "ub-control",
+ "ub-core",
+ "ub-fabric",
+ "ub-wire",
+]
+
+[[package]]
 name = "ub-fabric"
 version = "0.1.0"
 dependencies = [
@@ -1978,6 +1994,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "serde",
  "serde_json",
  "serde_yaml",
  "tokio",
@@ -1985,6 +2002,7 @@ dependencies = [
  "tracing-subscriber",
  "ub-control",
  "ub-core",
+ "ub-dataplane",
  "ub-fabric",
  "ub-obs",
  "ub-transport",

@@ -79,6 +79,12 @@ impl UdpFabric {
     pub fn local_addr(&self) -> SocketAddr {
         self.socket.local_addr().unwrap()
     }
+
+    /// Send a packet directly to a peer address without creating a session.
+    pub async fn send_to(&self, addr: SocketAddr, pkt: &[u8]) -> Result<(), UbError> {
+        self.socket.send_to(pkt, addr).await?;
+        Ok(())
+    }
 }
 
 /// UdpListener — waits for new peer sessions.

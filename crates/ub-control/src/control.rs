@@ -9,20 +9,25 @@ use tokio::task::JoinHandle;
 
 use ub_core::config::NodeConfig;
 use ub_core::error::UbError;
-use ub_core::mr::MrCacheTable;
+use ub_core::mr::{MrCacheTable, MrPublishEvent, MrTable};
 use ub_core::types::NodeState;
 
 use crate::member::{MemberTable, NodeInfo};
-use crate::message::{ControlMsg, HelloPayload, HeartbeatPayload, MemberDownPayload};
+use crate::message::{ControlMsg, HelloPayload, HeartbeatPayload, MemberDownPayload, MrPublishPayload, MrRevokePayload};
 
 /// Control plane engine.
 pub struct ControlPlane {
     config: Arc<NodeConfig>,
     members: Arc<MemberTable>,
     mr_cache: Arc<MrCacheTable>,
+    mr_table: Option<Arc<MrTable>>,
+    mr_event_rx: Option<mpsc::UnboundedReceiver<MrPublishEvent>>,
     local_epoch: u32,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    /// Watch channel for notifying data plane about new peers.
+    peer_change_tx: watch::Sender<u16>,
+    pub peer_change_rx: watch::Receiver<u16>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -30,15 +35,27 @@ impl ControlPlane {
     pub fn new(config: Arc<NodeConfig>, members: Arc<MemberTable>, mr_cache: Arc<MrCacheTable>) -> Self {
         let local_epoch = rand::random::<u32>();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (peer_change_tx, peer_change_rx) = watch::channel(0);
         ControlPlane {
             config,
             members,
             mr_cache,
+            mr_table: None,
+            mr_event_rx: None,
             local_epoch,
             shutdown_tx,
             shutdown_rx,
+            peer_change_tx,
+            peer_change_rx,
             tasks: Vec::new(),
         }
+    }
+
+    /// Set the local MR table for MR_PUBLISH/MR_REVOKE broadcast.
+    /// Takes the event receiver from the MrTable.
+    pub fn set_mr_table(&mut self, mr_table: Arc<MrTable>, mr_event_rx: mpsc::UnboundedReceiver<MrPublishEvent>) {
+        self.mr_table = Some(mr_table);
+        self.mr_event_rx = Some(mr_event_rx);
     }
 
     pub fn local_epoch(&self) -> u32 {
@@ -81,6 +98,8 @@ impl ControlPlane {
         let local_epoch = self.local_epoch;
         let mut shutdown_rx = self.shutdown_rx.clone();
         let mr_cache = Arc::clone(&self.mr_cache);
+        let mr_table_for_accept = self.mr_table.clone();
+        let peer_change_tx = self.peer_change_tx.clone();
 
         let accept_handle = tokio::spawn(async move {
             loop {
@@ -92,8 +111,10 @@ impl ControlPlane {
                                 let members = Arc::clone(&members);
                                 let config = Arc::clone(&config);
                                 let mr_cache = Arc::clone(&mr_cache);
+                                let mr_table = mr_table_for_accept.clone();
+                                let peer_change_tx = peer_change_tx.clone();
                                 tokio::spawn(handle_peer_connection(
-                                    stream, members, config, local_epoch, mr_cache, true,
+                                    stream, members, config, local_epoch, mr_cache, mr_table, true, peer_change_tx,
                                 ));
                             }
                             Err(e) => {
@@ -118,6 +139,8 @@ impl ControlPlane {
                     let config = Arc::clone(&self.config);
                     let local_epoch = self.local_epoch;
                     let mr_cache = Arc::clone(&self.mr_cache);
+                    let mr_table = self.mr_table.clone();
+                    let peer_change_tx = self.peer_change_tx.clone();
                     let peer_str = peer_addr_str.clone();
                     tokio::spawn(async move {
                         // Retry connection with backoff
@@ -127,7 +150,7 @@ impl ControlPlane {
                                 Ok(stream) => {
                                     tracing::info!("control plane: connected to peer {}", peer_str);
                                     handle_peer_connection(
-                                        stream, members, config, local_epoch, mr_cache, false,
+                                        stream, members, config, local_epoch, mr_cache, mr_table, false, peer_change_tx,
                                     ).await;
                                     break;
                                 }
@@ -141,6 +164,64 @@ impl ControlPlane {
                     });
                 }
             }
+        }
+
+        // MR publish event drain loop
+        if let Some(mut mr_event_rx) = self.mr_event_rx.take() {
+            let members_mr = Arc::clone(&self.members);
+            let mut shutdown_rx_mr = self.shutdown_rx.clone();
+
+            let mr_handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        event = mr_event_rx.recv() => {
+                            match event {
+                                Some(MrPublishEvent::Publish(info)) => {
+                                    let msg = ControlMsg::MrPublish(MrPublishPayload {
+                                        owner_node: info.owner_node,
+                                        mr_handle: info.mr_handle,
+                                        base_ub_addr: info.base_ub_addr,
+                                        len: info.len,
+                                        perms: info.perms,
+                                        device_kind: info.device_kind,
+                                    });
+                                    let encoded = msg.encode();
+                                    let encoded_bytes = encoded.to_vec();
+                                    let senders = members_mr.active_peer_senders();
+                                    for (_node_id, tx) in &senders {
+                                        let _ = tx.send(encoded_bytes.clone()).await;
+                                    }
+                                    tracing::info!(
+                                        "MR_PUBLISH broadcast: handle={} node={}",
+                                        info.mr_handle, info.owner_node
+                                    );
+                                }
+                                Some(MrPublishEvent::Revoke { owner_node, mr_handle }) => {
+                                    let msg = ControlMsg::MrRevoke(MrRevokePayload {
+                                        owner_node,
+                                        mr_handle,
+                                    });
+                                    let encoded = msg.encode();
+                                    let encoded_bytes = encoded.to_vec();
+                                    let senders = members_mr.active_peer_senders();
+                                    for (_node_id, tx) in &senders {
+                                        let _ = tx.send(encoded_bytes.clone()).await;
+                                    }
+                                    tracing::info!(
+                                        "MR_REVOKE broadcast: handle={} node={}",
+                                        mr_handle, owner_node
+                                    );
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = shutdown_rx_mr.changed() => {
+                            break;
+                        }
+                    }
+                }
+            });
+            self.tasks.push(mr_handle);
         }
 
         // Heartbeat loop
@@ -164,6 +245,12 @@ impl ControlPlane {
                         let encoded_bytes = encoded.to_vec();
 
                         // Send heartbeat to all active peers
+                        let senders = members_hb.active_peer_senders();
+                        for (node_id, tx) in &senders {
+                            let _ = tx.send(encoded_bytes.clone()).await;
+                        }
+
+                        // Check for missed heartbeats
                         let nodes = members_hb.list();
                         for node in &nodes {
                             if node.node_id == members_hb.local_node_id() {
@@ -172,11 +259,6 @@ impl ControlPlane {
                             if node.state == NodeState::Down {
                                 continue;
                             }
-                            if let Some(ref tx) = node.tx {
-                                let _ = tx.send(encoded_bytes.clone()).await;
-                            }
-
-                            // Check for missed heartbeats
                             if let Some(last_seen) = node.last_seen {
                                 if now > last_seen + interval_ms as u64 * fail_after as u64 {
                                     let count = missed_count.entry(node.node_id).or_insert(0);
@@ -225,7 +307,9 @@ async fn handle_peer_connection(
     config: Arc<NodeConfig>,
     local_epoch: u32,
     mr_cache: Arc<MrCacheTable>,
+    mr_table: Option<Arc<MrTable>>,
     _is_incoming: bool,
+    peer_change_tx: watch::Sender<u16>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
@@ -253,6 +337,8 @@ async fn handle_peer_connection(
     let config_read = Arc::clone(&config);
     let tx_clone = tx.clone();
     let local_epoch_read = local_epoch;
+    let mr_table_read = mr_table.clone();
+    let peer_change_tx_read = peer_change_tx.clone();
 
     let read_handle = tokio::spawn(async move {
         let _buf: Vec<u8> = Vec::new();
@@ -287,7 +373,8 @@ async fn handle_peer_connection(
             match ControlMsg::decode(&full_msg) {
                 Ok(msg) => {
                     process_control_message(
-                        msg, &members_read, &config_read, &mr_cache_read, &tx_clone, local_epoch_read,
+                        msg, &members_read, &config_read, &mr_cache_read, &mr_table_read,
+                        &tx_clone, local_epoch_read, &peer_change_tx_read,
                     ).await;
                 }
                 Err(e) => {
@@ -316,9 +403,11 @@ async fn process_control_message(
     msg: ControlMsg,
     members: &MemberTable,
     config: &NodeConfig,
-    _mr_cache: &MrCacheTable,
+    mr_cache: &MrCacheTable,
+    mr_table: &Option<Arc<MrTable>>,
     peer_tx: &mpsc::Sender<Vec<u8>>,
     local_epoch: u32,
+    peer_change_tx: &watch::Sender<u16>,
 ) {
     match msg {
         ControlMsg::Hello(hello) => {
@@ -330,7 +419,7 @@ async fn process_control_message(
             let info = NodeInfo {
                 node_id: hello.node_id,
                 state: NodeState::Active,
-                control_addr: String::new(), // We know the TCP connection but not the listen addr yet
+                control_addr: String::new(),
                 data_addr: hello.data_addr,
                 epoch: hello.local_epoch,
                 initial_credits: hello.initial_credits,
@@ -349,6 +438,12 @@ async fn process_control_message(
             });
             let encoded = ack.encode();
             let _ = peer_tx.send(encoded.to_vec()).await;
+
+            // Send existing MRs to the new peer
+            send_existing_mrs(mr_table, peer_tx).await;
+
+            // Notify data plane about new peer
+            let _ = peer_change_tx.send(hello.node_id);
         }
         ControlMsg::HelloAck(hello) => {
             tracing::info!(
@@ -366,6 +461,12 @@ async fn process_control_message(
                 tx: Some(peer_tx.clone()),
             };
             members.upsert(info);
+
+            // Send existing MRs to the new peer
+            send_existing_mrs(mr_table, peer_tx).await;
+
+            // Notify data plane about new peer
+            let _ = peer_change_tx.send(hello.node_id);
         }
         ControlMsg::Heartbeat(hb) => {
             members.update_last_seen(hb.node_id, now_millis());
@@ -398,14 +499,39 @@ async fn process_control_message(
                 perms: mr.perms,
                 device_kind: mr.device_kind,
             };
-            _mr_cache.insert(entry);
+            mr_cache.insert(entry);
         }
         ControlMsg::MrRevoke(revoke) => {
             tracing::info!("MR_REVOKE: node={} handle={}", revoke.owner_node, revoke.mr_handle);
-            _mr_cache.remove(revoke.owner_node, revoke.mr_handle);
+            mr_cache.remove(revoke.owner_node, revoke.mr_handle);
         }
         _ => {
             tracing::warn!("unhandled control message type");
+        }
+    }
+}
+
+/// Send all existing local MRs to a newly connected peer via MR_PUBLISH.
+async fn send_existing_mrs(
+    mr_table: &Option<Arc<MrTable>>,
+    peer_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    if let Some(ref table) = mr_table {
+        let entries = table.list();
+        for entry in entries {
+            let msg = ControlMsg::MrPublish(MrPublishPayload {
+                owner_node: entry.base_ub_addr.node_id(),
+                mr_handle: entry.handle,
+                base_ub_addr: entry.base_ub_addr,
+                len: entry.len,
+                perms: entry.perms,
+                device_kind: entry.device.kind(),
+            });
+            let encoded = msg.encode();
+            if let Err(e) = peer_tx.send(encoded.to_vec()).await {
+                tracing::warn!("failed to send MR_PUBLISH to new peer: {e}");
+                break;
+            }
         }
     }
 }
