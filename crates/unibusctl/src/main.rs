@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -36,6 +38,57 @@ enum Commands {
     JettyPollCqe {
         /// Jetty handle
         jetty_handle: u32,
+    },
+    /// Run a quick latency/throughput benchmark via admin API
+    Bench {
+        /// UB address of the target MR
+        #[arg(long)]
+        ub_addr: String,
+        /// Number of iterations per verb
+        #[arg(short, long, default_value = "100")]
+        iterations: u32,
+        /// Data size in bytes for write/read
+        #[arg(short, long, default_value = "1024")]
+        size: u32,
+    },
+    /// Initialize a KV store on the target node
+    KvInit {
+        /// Number of KV slots
+        #[arg(short, long, default_value = "16")]
+        slots: u32,
+    },
+    /// Put a key-value pair into a KV slot
+    KvPut {
+        /// UB address of the KV MR
+        ub_addr: String,
+        /// Slot index
+        slot: u32,
+        /// Key string
+        key: String,
+        /// Value string
+        value: String,
+    },
+    /// Get a value from a KV slot
+    KvGet {
+        /// UB address of the KV MR
+        ub_addr: String,
+        /// Slot index
+        slot: u32,
+        /// Key string
+        key: String,
+    },
+    /// Compare-and-swap a KV slot
+    KvCas {
+        /// UB address of the KV MR
+        ub_addr: String,
+        /// Slot index
+        slot: u32,
+        /// Key string
+        key: String,
+        /// Expected current version
+        expect_version: u64,
+        /// New value string
+        value: String,
     },
 }
 
@@ -197,7 +250,168 @@ async fn main() -> anyhow::Result<()> {
                 println!("{body}");
             }
         }
+        Commands::Bench { ub_addr, iterations, size } => {
+            println!("UniBus Verb Benchmark");
+            println!("  target: {}", ub_addr);
+            println!("  iterations: {}", iterations);
+            println!("  data size: {} bytes", size);
+
+            let data = vec![0xABu8; size as usize];
+
+            // Write benchmark
+            let mut write_latencies = Vec::with_capacity(iterations as usize);
+            let mut ok_count = 0u32;
+            let mut err_count = 0u32;
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let url = format!("{}/admin/verb/write", cli.addr);
+                let resp = client.post(&url)
+                    .json(&serde_json::json!({"ub_addr": ub_addr, "data": data}))
+                    .send().await?;
+                let body: serde_json::Value = resp.json().await?;
+                let elapsed = start.elapsed();
+                if body.get("status").is_some() {
+                    ok_count += 1;
+                } else {
+                    err_count += 1;
+                }
+                write_latencies.push(elapsed.as_micros() as f64);
+            }
+            print_stats("write", &write_latencies, ok_count, err_count, size);
+
+            // Read benchmark
+            let mut read_latencies = Vec::with_capacity(iterations as usize);
+            let mut ok_count = 0u32;
+            let mut err_count = 0u32;
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let url = format!("{}/admin/verb/read", cli.addr);
+                let resp = client.post(&url)
+                    .json(&serde_json::json!({"ub_addr": ub_addr, "len": size}))
+                    .send().await?;
+                let body: serde_json::Value = resp.json().await?;
+                let elapsed = start.elapsed();
+                if body.get("data").is_some() {
+                    ok_count += 1;
+                } else {
+                    err_count += 1;
+                }
+                read_latencies.push(elapsed.as_micros() as f64);
+            }
+            print_stats("read", &read_latencies, ok_count, err_count, size);
+
+            // Atomic FAA benchmark
+            let mut faa_latencies = Vec::with_capacity(iterations as usize);
+            let mut ok_count = 0u32;
+            let mut err_count = 0u32;
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let url = format!("{}/admin/verb/atomic-faa", cli.addr);
+                let resp = client.post(&url)
+                    .json(&serde_json::json!({"ub_addr": ub_addr, "add": 1}))
+                    .send().await?;
+                let body: serde_json::Value = resp.json().await?;
+                let elapsed = start.elapsed();
+                if body.get("old_value").is_some() {
+                    ok_count += 1;
+                } else {
+                    err_count += 1;
+                }
+                faa_latencies.push(elapsed.as_micros() as f64);
+            }
+            print_stats("atomic_faa", &faa_latencies, ok_count, err_count, 8);
+        }
+        Commands::KvInit { slots } => {
+            let url = format!("{}/admin/kv/init", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"slots": slots}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").is_some() {
+                let addr = body.get("ub_addr").and_then(|v| v.as_str()).unwrap_or("?");
+                let handle = body.get("mr_handle").and_then(|v| v.as_u64()).unwrap_or(0);
+                let slot_size = body.get("slot_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("KV store initialized: slots={slots} handle={handle} addr={addr} slot_size={slot_size}");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::KvPut { ub_addr, slot, key, value } => {
+            let url = format!("{}/admin/kv/put", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"ub_addr": ub_addr, "slot": slot, "key": key, "value": value}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").is_some() {
+                let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("PUT slot={slot} key={key} version={version}");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::KvGet { ub_addr, slot, key } => {
+            let url = format!("{}/admin/kv/get", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"ub_addr": ub_addr, "slot": slot, "key": key}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("key").is_some() {
+                let found_key = body.get("key").and_then(|v| v.as_str()).unwrap_or("?");
+                let found_value = body.get("value").and_then(|v| v.as_str()).unwrap_or("?");
+                let version = body.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("GET slot={slot} key={found_key} value={found_value} version={version}");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::KvCas { ub_addr, slot, key, expect_version, value } => {
+            let url = format!("{}/admin/kv/cas", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"ub_addr": ub_addr, "slot": slot, "key": key, "expect_version": expect_version, "value": value}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").and_then(|v| v.as_str()) == Some("ok") {
+                let new_ver = body.get("new_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("CAS slot={slot} key={key} succeeded: version {expect_version} -> {new_ver}");
+            } else if body.get("status").and_then(|v| v.as_str()) == Some("cas_failed") {
+                let current = body.get("current_version").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("CAS slot={slot} key={key} failed: expected version {expect_version}, current is {current}");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn print_stats(verb: &str, latencies: &[f64], ok: u32, err: u32, size_bytes: u32) {
+    let mut sorted = latencies.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    let n = sorted.len();
+    let p50 = sorted[n / 2];
+    let p90 = sorted[(n as f64 * 0.9) as usize];
+    let p99 = sorted[(n as f64 * 0.99) as usize];
+    let avg: f64 = sorted.iter().sum::<f64>() / n as f64;
+    let total_time_s: f64 = sorted.iter().sum::<f64>() / 1_000_000.0;
+    let ops_per_s = if total_time_s > 0.0 { ok as f64 / total_time_s } else { 0.0 };
+    let throughput_mib = if total_time_s > 0.0 {
+        (ok as f64 * size_bytes as f64) / (1024.0 * 1024.0) / total_time_s
+    } else {
+        0.0
+    };
+
+    println!("\n  {}:", verb);
+    println!("    ok={ok} err={err}");
+    println!("    latency (µs): avg={avg:.1} p50={p50:.1} p90={p90:.1} p99={p99:.1}");
+    println!("    throughput:    {ops_per_s:.0} ops/s  {throughput_mib:.2} MiB/s");
 }

@@ -191,6 +191,7 @@ impl DataPlaneEngine {
     }
 
     /// Remote write (fire-and-forget).
+    #[tracing::instrument(skip(self, data))]
     pub async fn ub_write_remote(
         &self,
         addr: UbAddr,
@@ -220,6 +221,7 @@ impl DataPlaneEngine {
     }
 
     /// Remote read (request-response).
+    #[tracing::instrument(skip(self))]
     pub async fn ub_read_remote(
         &self,
         addr: UbAddr,
@@ -263,6 +265,7 @@ impl DataPlaneEngine {
     }
 
     /// Remote atomic CAS (request-response).
+    #[tracing::instrument(skip(self))]
     pub async fn ub_atomic_cas_remote(
         &self,
         addr: UbAddr,
@@ -313,6 +316,7 @@ impl DataPlaneEngine {
     }
 
     /// Remote atomic FAA (request-response).
+    #[tracing::instrument(skip(self))]
     pub async fn ub_atomic_faa_remote(
         &self,
         addr: UbAddr,
@@ -457,6 +461,14 @@ impl DataPlaneEngine {
         &self.fabric
     }
 
+    pub fn mr_table(&self) -> &Arc<MrTable> {
+        &self.mr_table
+    }
+
+    pub fn mr_cache(&self) -> &Arc<MrCacheTable> {
+        &self.mr_cache
+    }
+
     pub fn jetty_table(&self) -> &Arc<JettyTable> {
         &self.jetty_table
     }
@@ -471,6 +483,7 @@ impl DataPlaneEngine {
 }
 
 /// Handle an inbound frame that passed transport dedup — dispatch to verb handler.
+#[tracing::instrument(skip(transport, mr_table, _mr_cache, jetty_table, inbound, pending, fabric), fields(local_node_id = local_node_id, remote_node = inbound.header.src_node, verb = ?inbound.ext.verb))]
 async fn handle_verb_frame(
     inbound: InboundFrame,
     mr_table: &MrTable,
@@ -842,7 +855,10 @@ fn handle_send(
         verb: Verb::Send,
     };
     if let Err(e) = jetty.push_cqe(cqe) {
+        ub_obs::incr(ub_obs::CQE_ERR);
         tracing::warn!("SEND: failed to push CQE to jetty {}: {e}", ext.jetty_dst);
+    } else {
+        ub_obs::incr(ub_obs::CQE_OK);
     }
 }
 
@@ -897,7 +913,10 @@ fn handle_write_imm(
         verb: Verb::WriteImm,
     };
     if let Err(e) = jetty.push_cqe(cqe) {
+        ub_obs::incr(ub_obs::CQE_ERR);
         tracing::warn!("WRITE_IMM: failed to push CQE to jetty {}: {e}", ext.jetty_dst);
+    } else {
+        ub_obs::incr(ub_obs::CQE_OK);
     }
 }
 

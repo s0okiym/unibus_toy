@@ -321,6 +321,7 @@ impl ControlPlane {
 }
 
 /// Handle a peer TCP connection (both accepted and initiated).
+#[tracing::instrument(skip(stream, members, config, mr_cache, mr_table, _is_incoming, peer_change_tx), fields(local_epoch = local_epoch))]
 async fn handle_peer_connection(
     stream: TcpStream,
     members: Arc<MemberTable>,
@@ -419,6 +420,7 @@ async fn handle_peer_connection(
 }
 
 /// Process a received control message.
+#[tracing::instrument(skip(msg, members, config, mr_cache, mr_table, peer_tx, peer_change_tx), fields(local_epoch = local_epoch))]
 async fn process_control_message(
     msg: ControlMsg,
     members: &MemberTable,

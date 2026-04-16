@@ -16,6 +16,7 @@ use ub_core::mr::{MrCacheTable, MrTable};
 use ub_core::types::{JettyAddr, MrPerms, PeerChangeEvent};
 use ub_dataplane::DataPlaneEngine;
 use ub_fabric::udp::UdpFabric;
+use ub_obs::metrics;
 use ub_transport::manager::TransportManager;
 
 #[derive(Parser)]
@@ -34,6 +35,7 @@ struct AppState {
     mr_cache: Arc<MrCacheTable>,
     jetty_table: Arc<ub_core::jetty::JettyTable>,
     dataplane: Arc<tokio::sync::Mutex<DataPlaneEngine>>,
+    prom_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +103,47 @@ struct VerbWriteImmRequest {
     dst_jetty_id: u32,
 }
 
+// ── KV Demo request types ─────────────────────────────────────
+
+/// KV slot layout: key[32] + value[64] + version[8] = 104 bytes
+const KV_SLOT_SIZE: usize = 104;
+const KV_KEY_LEN: usize = 32;
+const KV_VALUE_LEN: usize = 64;
+const KV_VERSION_OFFSET: usize = 96;
+
+#[derive(Deserialize)]
+struct KvInitRequest {
+    /// Number of KV slots (default 16)
+    #[serde(default = "default_kv_slots")]
+    slots: u32,
+}
+
+fn default_kv_slots() -> u32 { 16 }
+
+#[derive(Deserialize)]
+struct KvPutRequest {
+    ub_addr: String,
+    slot: u32,
+    key: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct KvGetRequest {
+    ub_addr: String,
+    slot: u32,
+    key: String,
+}
+
+#[derive(Deserialize)]
+struct KvCasRequest {
+    ub_addr: String,
+    slot: u32,
+    key: String,
+    expect_version: u64,
+    value: String,
+}
+
 fn parse_ub_addr(s: &str) -> Result<UbAddr, String> {
     UbAddr::from_text(s).map_err(|e| format!("invalid ub_addr: {e}"))
 }
@@ -116,6 +159,10 @@ async fn main() {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    // Initialize metrics recorder
+    let prom_handle = metrics::install_recorder().clone();
+    metrics::describe_metrics();
 
     // Load config
     let config_str = std::fs::read_to_string(&cli.config)
@@ -227,6 +274,7 @@ async fn main() {
         mr_cache: Arc::clone(&mr_cache),
         jetty_table: Arc::clone(&jetty_table),
         dataplane,
+        prom_handle,
     });
 
     let app = Router::new()
@@ -247,6 +295,11 @@ async fn main() {
         .route("/admin/verb/send", post(verb_send))
         .route("/admin/verb/send-with-imm", post(verb_send_with_imm))
         .route("/admin/verb/write-imm", post(verb_write_imm))
+        .route("/admin/kv/init", post(kv_init))
+        .route("/admin/kv/put", post(kv_put))
+        .route("/admin/kv/get", post(kv_get))
+        .route("/admin/kv/cas", post(kv_cas))
+        .route("/metrics", get(metrics_endpoint))
         .with_state(state);
 
     let metrics_addr: std::net::SocketAddr = config.obs.metrics_listen.parse()
@@ -555,6 +608,293 @@ async fn verb_write_imm(
         Ok(()) => Json(json!({"status": "ok"})),
         Err(e) => Json(json!({"error": format!("{}", e)})),
     }
+}
+
+// ── KV Demo handlers ────────────────────────────────────────────
+
+async fn kv_init(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KvInitRequest>,
+) -> Json<Value> {
+    let total_len = req.slots as u64 * KV_SLOT_SIZE as u64;
+    let dev: Arc<dyn Device> = Arc::new(MemoryDevice::new(total_len as usize));
+    match state.mr_table.register(dev, total_len, MrPerms::READ | MrPerms::WRITE | MrPerms::ATOMIC) {
+        Ok((addr, handle)) => {
+            // Initialize all slots: version=0, key and value zeroed
+            // For direct device access, use offset 0 (each MR gets its own device)
+            let entry = state.mr_table.lookup(handle.0).unwrap();
+            let zero_slot = vec![0u8; KV_SLOT_SIZE];
+            for i in 0..req.slots {
+                let slot_base = i as u64 * KV_SLOT_SIZE as u64;
+                let version_off = slot_base + KV_VERSION_OFFSET as u64;
+                let _ = entry.device.write(version_off, &0u64.to_ne_bytes());
+                let _ = entry.device.write(slot_base, &zero_slot);
+            }
+            Json(json!({
+                "status": "ok",
+                "mr_handle": handle.0,
+                "ub_addr": format!("{}", addr),
+                "slots": req.slots,
+                "slot_size": KV_SLOT_SIZE,
+            }))
+        }
+        Err(e) => Json(json!({"error": format!("{}", e)})),
+    }
+}
+
+async fn kv_put(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KvPutRequest>,
+) -> Json<Value> {
+    let addr = match parse_ub_addr(&req.ub_addr) {
+        Ok(a) => a,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let slot_offset = req.slot as u64 * KV_SLOT_SIZE as u64;
+
+    // If the MR is local, use direct device access (avoids data-plane roundtrip)
+    if let Some((entry, offset_in_mr)) = state.mr_table.lookup_by_addr(addr) {
+        // offset_in_mr is already the correct device offset for this MR
+        let version_offset = offset_in_mr + slot_offset + KV_VERSION_OFFSET as u64;
+        let old_version = match entry.device.atomic_faa(version_offset, 1) {
+            Ok(v) => v,
+            Err(e) => return Json(json!({"error": format!("{}", e)})),
+        };
+        let new_version = old_version + 1;
+
+        // Write key + value directly
+        let mut kv_data = vec![0u8; KV_KEY_LEN + KV_VALUE_LEN];
+        let key_bytes = req.key.as_bytes();
+        let copy_len = key_bytes.len().min(KV_KEY_LEN);
+        kv_data[..copy_len].copy_from_slice(&key_bytes[..copy_len]);
+        let value_bytes = req.value.as_bytes();
+        let copy_len = value_bytes.len().min(KV_VALUE_LEN);
+        kv_data[KV_KEY_LEN..KV_KEY_LEN + copy_len].copy_from_slice(&value_bytes[..copy_len]);
+
+        let data_offset = offset_in_mr + slot_offset;
+        if let Err(e) = entry.device.write(data_offset, &kv_data) {
+            return Json(json!({"error": format!("{}", e)}));
+        }
+
+        Json(json!({"status": "ok", "version": new_version}))
+    } else {
+        // Remote MR — use data-plane verbs
+        let dp = state.dataplane.lock().await;
+
+        let version_addr = UbAddr::new(
+            addr.pod_id(),
+            addr.node_id(),
+            addr.device_id(),
+            addr.offset() + slot_offset + KV_VERSION_OFFSET as u64,
+            addr.reserved(),
+        );
+
+        let old_version = match dp.ub_atomic_faa_remote(version_addr, 1).await {
+            Ok(v) => v,
+            Err(e) => return Json(json!({"error": format!("{}", e)})),
+        };
+        let new_version = old_version + 1;
+
+        let write_addr = UbAddr::new(
+            addr.pod_id(),
+            addr.node_id(),
+            addr.device_id(),
+            addr.offset() + slot_offset,
+            addr.reserved(),
+        );
+
+        let mut kv_data = vec![0u8; KV_KEY_LEN + KV_VALUE_LEN];
+        let key_bytes = req.key.as_bytes();
+        let copy_len = key_bytes.len().min(KV_KEY_LEN);
+        kv_data[..copy_len].copy_from_slice(&key_bytes[..copy_len]);
+        let value_bytes = req.value.as_bytes();
+        let copy_len = value_bytes.len().min(KV_VALUE_LEN);
+        kv_data[KV_KEY_LEN..KV_KEY_LEN + copy_len].copy_from_slice(&value_bytes[..copy_len]);
+
+        match dp.ub_write_remote(write_addr, &kv_data).await {
+            Ok(()) => Json(json!({"status": "ok", "version": new_version})),
+            Err(e) => Json(json!({"error": format!("{}", e)})),
+        }
+    }
+}
+
+async fn kv_get(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KvGetRequest>,
+) -> Json<Value> {
+    let addr = match parse_ub_addr(&req.ub_addr) {
+        Ok(a) => a,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let slot_offset = req.slot as u64 * KV_SLOT_SIZE as u64;
+
+    // Read the slot — local or remote
+    let data = if let Some((entry, offset_in_mr)) = state.mr_table.lookup_by_addr(addr) {
+        // Local MR — direct device read
+        let mut buf = vec![0u8; KV_SLOT_SIZE];
+        let offset = offset_in_mr + slot_offset;
+        if let Err(e) = entry.device.read(offset, &mut buf) {
+            return Json(json!({"error": format!("{}", e)}));
+        }
+        buf
+    } else {
+        // Remote MR — use data-plane read
+        let read_addr = UbAddr::new(
+            addr.pod_id(),
+            addr.node_id(),
+            addr.device_id(),
+            addr.offset() + slot_offset,
+            addr.reserved(),
+        );
+        let dp = state.dataplane.lock().await;
+        match dp.ub_read_remote(read_addr, KV_SLOT_SIZE as u32).await {
+            Ok(data) => data,
+            Err(e) => return Json(json!({"error": format!("{}", e)})),
+        }
+    };
+
+    if data.len() < KV_SLOT_SIZE {
+        return Json(json!({"error": format!("read returned {} bytes, expected {}", data.len(), KV_SLOT_SIZE)}));
+    }
+
+    // Extract key, value, version
+    let key_bytes = &data[..KV_KEY_LEN];
+    let value_bytes = &data[KV_KEY_LEN..KV_KEY_LEN + KV_VALUE_LEN];
+    let version = u64::from_ne_bytes(data[KV_VERSION_OFFSET..KV_VERSION_OFFSET + 8].try_into().unwrap_or([0; 8]));
+
+    // Trim null bytes from key and value for display
+    let key_str = String::from_utf8_lossy(key_bytes).trim_end_matches('\0').to_string();
+    let value_str = String::from_utf8_lossy(value_bytes).trim_end_matches('\0').to_string();
+
+    // Check if key matches
+    let req_key_padded = pad_string(&req.key, KV_KEY_LEN);
+    let key_matches = key_bytes == req_key_padded.as_slice();
+
+    if !key_matches && version > 0 {
+        return Json(json!({"error": "key mismatch", "expected_key": req.key, "found_key": key_str}));
+    }
+
+    Json(json!({
+        "key": key_str,
+        "value": value_str,
+        "version": version,
+    }))
+}
+
+async fn kv_cas(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<KvCasRequest>,
+) -> Json<Value> {
+    let addr = match parse_ub_addr(&req.ub_addr) {
+        Ok(a) => a,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let slot_offset = req.slot as u64 * KV_SLOT_SIZE as u64;
+    let new_version = req.expect_version + 1;
+
+    if let Some((entry, offset_in_mr)) = state.mr_table.lookup_by_addr(addr) {
+        // Local MR — direct device access
+        let version_offset = offset_in_mr + slot_offset + KV_VERSION_OFFSET as u64;
+        let old_value = match entry.device.atomic_cas(version_offset, req.expect_version, new_version) {
+            Ok(v) => v,
+            Err(e) => return Json(json!({"error": format!("{}", e)})),
+        };
+
+        if old_value == req.expect_version {
+            // CAS succeeded — write new key+value
+            let mut slot_data = vec![0u8; KV_KEY_LEN + KV_VALUE_LEN];
+            let key_bytes = req.key.as_bytes();
+            let copy_len = key_bytes.len().min(KV_KEY_LEN);
+            slot_data[..copy_len].copy_from_slice(&key_bytes[..copy_len]);
+            let value_bytes = req.value.as_bytes();
+            let copy_len = value_bytes.len().min(KV_VALUE_LEN);
+            slot_data[KV_KEY_LEN..KV_KEY_LEN + copy_len].copy_from_slice(&value_bytes[..copy_len]);
+
+            let data_offset = offset_in_mr + slot_offset;
+            let _ = entry.device.write(data_offset, &slot_data);
+
+            Json(json!({"status": "ok", "old_version": old_value, "new_version": new_version}))
+        } else {
+            Json(json!({"status": "cas_failed", "current_version": old_value, "expected_version": req.expect_version}))
+        }
+    } else {
+        // Remote MR — use data-plane verbs
+        let version_addr = UbAddr::new(
+            addr.pod_id(),
+            addr.node_id(),
+            addr.device_id(),
+            addr.offset() + slot_offset + KV_VERSION_OFFSET as u64,
+            addr.reserved(),
+        );
+
+        let dp = state.dataplane.lock().await;
+        match dp.ub_atomic_cas_remote(version_addr, req.expect_version, new_version).await {
+            Ok(old_value) => {
+                if old_value == req.expect_version {
+                    // CAS succeeded — write new key+value
+                    let write_addr = UbAddr::new(
+                        addr.pod_id(),
+                        addr.node_id(),
+                        addr.device_id(),
+                        addr.offset() + slot_offset,
+                        addr.reserved(),
+                    );
+
+                    let mut slot_data = vec![0u8; KV_KEY_LEN + KV_VALUE_LEN];
+                    let key_bytes = req.key.as_bytes();
+                    let copy_len = key_bytes.len().min(KV_KEY_LEN);
+                    slot_data[..copy_len].copy_from_slice(&key_bytes[..copy_len]);
+                    let value_bytes = req.value.as_bytes();
+                    let copy_len = value_bytes.len().min(KV_VALUE_LEN);
+                    slot_data[KV_KEY_LEN..KV_KEY_LEN + copy_len].copy_from_slice(&value_bytes[..copy_len]);
+
+                    let _ = dp.ub_write_remote(write_addr, &slot_data).await;
+
+                    Json(json!({"status": "ok", "old_version": old_value, "new_version": new_version}))
+                } else {
+                    Json(json!({"status": "cas_failed", "current_version": old_value, "expected_version": req.expect_version}))
+                }
+            }
+            Err(e) => Json(json!({"error": format!("{}", e)})),
+        }
+    }
+}
+
+/// Pad a string with null bytes to the specified length.
+fn pad_string(s: &str, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let copy_len = s.as_bytes().len().min(len);
+    buf[..copy_len].copy_from_slice(&s.as_bytes()[..copy_len]);
+    buf
+}
+
+async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl axum::response::IntoResponse {
+    // Update gauge metrics before rendering
+    let mr_entries = state.mr_table.list();
+    let mut memory_count = 0u64;
+    let mut npu_count = 0u64;
+    for mr in &mr_entries {
+        match mr.device.kind() {
+            ub_core::types::DeviceKind::Memory => memory_count += 1,
+            ub_core::types::DeviceKind::Npu => npu_count += 1,
+        }
+    }
+    ub_obs::set_gauge(ub_obs::MR_COUNT, memory_count as f64); // default (no label)
+    ub_obs::set_gauge_label(ub_obs::MR_COUNT, "device", "memory", memory_count as f64);
+    ub_obs::set_gauge_label(ub_obs::MR_COUNT, "device", "npu", npu_count as f64);
+
+    let jetty_count = state.jetty_table.list().len() as f64;
+    ub_obs::set_gauge(ub_obs::JETTY_COUNT, jetty_count);
+
+    let output = state.prom_handle.render();
+    (
+        axum::http::StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        output,
+    )
 }
 
 fn parse_perms(s: &str) -> MrPerms {

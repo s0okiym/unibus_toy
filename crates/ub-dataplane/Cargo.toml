@@ -9,9 +9,17 @@ ub-wire = { workspace = true }
 ub-fabric = { workspace = true }
 ub-control = { workspace = true }
 ub-transport = { workspace = true }
+ub-obs = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }
 byteorder = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "verb_bench"
+harness = false

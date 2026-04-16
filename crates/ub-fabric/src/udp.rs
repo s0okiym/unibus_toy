@@ -53,8 +53,10 @@ impl UdpFabric {
                     Ok((len, src_addr)) => {
                         // Loss injection: drop packet with probability loss_rate
                         if inject_loss && rand::random::<f64>() < loss_rate {
+                            ub_obs::incr(ub_obs::DROPS);
                             continue;
                         }
+                        ub_obs::incr(ub_obs::RX_PKTS);
                         let pkt = BytesMut::from(&buf[..len]);
                         if let Some(sender) = demux_clone.get(&src_addr) {
                             if sender.send(pkt).await.is_err() {
@@ -96,6 +98,7 @@ impl UdpFabric {
     /// Send a packet directly to a peer address without creating a session.
     pub async fn send_to(&self, addr: SocketAddr, pkt: &[u8]) -> Result<(), UbError> {
         self.socket.send_to(pkt, addr).await?;
+        ub_obs::incr(ub_obs::TX_PKTS);
         Ok(())
     }
 }

@@ -109,6 +109,7 @@ impl TransportManager {
 
                 // Retransmit
                 for (remote_node, frame) in retransmit_frames {
+                    ub_obs::incr(ub_obs::RETRANS);
                     if let Some(sender) = peer_senders.get(&remote_node) {
                         let _ = sender.send(frame).await;
                     }
@@ -178,6 +179,7 @@ impl TransportManager {
 
     /// Send a frame through the reliable transport.
     /// Assigns a sequence number, sets ACK_REQ, and queues for retransmission.
+    #[tracing::instrument(skip(self, frame_data))]
     pub fn send(
         &self,
         remote_node: u16,
@@ -224,6 +226,7 @@ impl TransportManager {
 
     /// Handle an incoming raw frame from the network.
     /// Dispatches to the appropriate handler based on frame type.
+    #[tracing::instrument(skip(self, raw))]
     pub fn handle_incoming(&self, raw: &[u8]) {
         if let Ok((header, ext, payload)) = decode_frame(raw) {
             match header.frame_type {

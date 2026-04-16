@@ -57,6 +57,9 @@ clap = { version = "4", features = ["derive"] }
 # Random
 rand = "0.9"
 
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
 # Bitflags
 bitflags = "2"
 
