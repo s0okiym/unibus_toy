@@ -93,6 +93,20 @@ impl DeviceKind {
 /// Node identifier.
 pub type NodeId = u16;
 
+/// Peer state change event emitted by the control plane.
+/// Used to notify the data plane / transport layer of membership changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerChangeEvent {
+    /// A new peer has joined (Hello/HelloAck received).
+    Joined { node_id: u16, epoch: u32 },
+    /// A previously Suspect peer has recovered to Active.
+    Recovered { node_id: u16 },
+    /// A peer has transitioned to Suspect (missed heartbeats).
+    Suspect { node_id: u16 },
+    /// A peer has been marked Down.
+    Down { node_id: u16, epoch: u32 },
+}
+
 /// MR state for lifecycle management (FR-ADDR-5 / §8.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -175,5 +189,25 @@ mod tests {
     fn test_node_state_display() {
         assert_eq!(format!("{}", NodeState::Active), "Active");
         assert_eq!(format!("{}", NodeState::Suspect), "Suspect");
+    }
+
+    #[test]
+    fn test_peer_change_event_equality() {
+        let e1 = PeerChangeEvent::Joined { node_id: 2, epoch: 100 };
+        let e2 = PeerChangeEvent::Joined { node_id: 2, epoch: 100 };
+        let e3 = PeerChangeEvent::Joined { node_id: 2, epoch: 99 };
+        assert_eq!(e1, e2);
+        assert_ne!(e1, e3);
+
+        let s1 = PeerChangeEvent::Suspect { node_id: 2 };
+        let s2 = PeerChangeEvent::Suspect { node_id: 3 };
+        assert_ne!(s1, s2);
+
+        let r1 = PeerChangeEvent::Recovered { node_id: 2 };
+        assert_ne!(s1, r1);
+
+        let d1 = PeerChangeEvent::Down { node_id: 2, epoch: 100 };
+        let d2 = PeerChangeEvent::Down { node_id: 2, epoch: 101 };
+        assert_ne!(d1, d2);
     }
 }

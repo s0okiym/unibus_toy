@@ -8,6 +8,7 @@ ub-core = { workspace = true }
 ub-wire = { workspace = true }
 ub-fabric = { workspace = true }
 ub-control = { workspace = true }
+ub-transport = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }

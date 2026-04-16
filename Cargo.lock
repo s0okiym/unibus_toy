@@ -1913,6 +1913,7 @@ dependencies = [
  "ub-control",
  "ub-core",
  "ub-fabric",
+ "ub-transport",
  "ub-wire",
 ]
 
@@ -1924,6 +1925,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "parking_lot",
+ "rand",
  "tokio",
  "tracing",
  "ub-core",
@@ -1956,7 +1958,10 @@ dependencies = [
 name = "ub-transport"
 version = "0.1.0"
 dependencies = [
+ "byteorder",
  "bytes",
+ "dashmap",
+ "parking_lot",
  "tokio",
  "tracing",
  "ub-core",

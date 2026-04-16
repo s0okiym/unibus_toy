@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use ub_fabric::fabric::{Fabric, Session};
 use ub_fabric::peer_addr::PeerAddr;
 use ub_fabric::udp::UdpFabric;
+use ub_transport::manager::{InboundFrame, TransportManager};
 use ub_wire::codec::{decode_frame, encode_frame};
 use ub_wire::frame::*;
 
@@ -39,10 +40,10 @@ pub struct DataPlaneEngine {
     mr_cache: Arc<MrCacheTable>,
     jetty_table: Arc<JettyTable>,
     fabric: Arc<UdpFabric>,
+    transport: Arc<TransportManager>,
+    inbound_rx: Option<mpsc::UnboundedReceiver<InboundFrame>>,
     pending_requests: Arc<DashMap<u64, oneshot::Sender<VerbResponse>>>,
     next_opaque: Arc<AtomicU64>,
-    /// Outbound send channels to peer data plane addresses.
-    peer_senders: Arc<DashMap<u16, mpsc::Sender<Vec<u8>>>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -54,10 +55,11 @@ impl Clone for DataPlaneEngine {
             mr_cache: Arc::clone(&self.mr_cache),
             jetty_table: Arc::clone(&self.jetty_table),
             fabric: Arc::clone(&self.fabric),
+            transport: Arc::clone(&self.transport),
+            inbound_rx: None, // only original engine owns the receiver
             pending_requests: Arc::clone(&self.pending_requests),
             next_opaque: Arc::clone(&self.next_opaque),
-            peer_senders: Arc::clone(&self.peer_senders),
-            tasks: Vec::new(), // tasks are owned by the original engine
+            tasks: Vec::new(),
         }
     }
 }
@@ -69,6 +71,8 @@ impl DataPlaneEngine {
         mr_cache: Arc<MrCacheTable>,
         jetty_table: Arc<JettyTable>,
         fabric: Arc<UdpFabric>,
+        transport: Arc<TransportManager>,
+        inbound_rx: mpsc::UnboundedReceiver<InboundFrame>,
     ) -> Self {
         DataPlaneEngine {
             local_node_id,
@@ -76,9 +80,10 @@ impl DataPlaneEngine {
             mr_cache,
             jetty_table,
             fabric,
+            transport,
+            inbound_rx: Some(inbound_rx),
             pending_requests: Arc::new(DashMap::new()),
             next_opaque: Arc::new(AtomicU64::new(1)),
-            peer_senders: Arc::new(DashMap::new()),
             tasks: Vec::new(),
         }
     }
@@ -87,32 +92,18 @@ impl DataPlaneEngine {
     pub async fn start(&mut self) -> Result<(), UbError> {
         let mut listener = self.fabric.listen(PeerAddr::Inet("0.0.0.0:0".parse().unwrap())).await?;
 
-        let mr_table = Arc::clone(&self.mr_table);
-        let mr_cache = Arc::clone(&self.mr_cache);
-        let jetty_table = Arc::clone(&self.jetty_table);
-        let pending = Arc::clone(&self.pending_requests);
-        let local_node_id = self.local_node_id;
-        let fabric = Arc::clone(&self.fabric);
-
-        let handle = tokio::spawn(async move {
+        // Task 1: accept incoming UDP sessions, feed raw frames to transport
+        let transport = Arc::clone(&self.transport);
+        let accept_handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok(mut session) => {
-                        let mr_table = Arc::clone(&mr_table);
-                        let mr_cache = Arc::clone(&mr_cache);
-                        let jetty_table = Arc::clone(&jetty_table);
-                        let pending = Arc::clone(&pending);
-                        let local_node_id = local_node_id;
-                        let fabric = Arc::clone(&fabric);
-
+                        let transport = Arc::clone(&transport);
                         tokio::spawn(async move {
                             loop {
                                 match session.recv().await {
                                     Ok(raw_frame) => {
-                                        handle_incoming_frame(
-                                            &raw_frame, &mr_table, &mr_cache, &jetty_table, &pending,
-                                            &mut session, local_node_id, &fabric,
-                                        ).await;
+                                        transport.handle_incoming(&raw_frame);
                                     }
                                     Err(e) => {
                                         tracing::warn!("data plane recv error: {e}");
@@ -128,21 +119,47 @@ impl DataPlaneEngine {
                 }
             }
         });
-        self.tasks.push(handle);
+        self.tasks.push(accept_handle);
+
+        // Task 2: consume InboundFrames from transport and dispatch to verb handlers
+        let mr_table = Arc::clone(&self.mr_table);
+        let mr_cache = Arc::clone(&self.mr_cache);
+        let jetty_table = Arc::clone(&self.jetty_table);
+        let pending = Arc::clone(&self.pending_requests);
+        let transport_inbound = Arc::clone(&self.transport);
+        let local_node_id = self.local_node_id;
+        let fabric = Arc::clone(&self.fabric);
+
+        let inbound_rx = self.inbound_rx.take()
+            .expect("inbound_rx already consumed");
+
+        let inbound_handle = tokio::spawn(async move {
+            let mut inbound_rx = inbound_rx;
+            while let Some(inbound) = inbound_rx.recv().await {
+                handle_verb_frame(
+                    inbound,
+                    &mr_table,
+                    &mr_cache,
+                    &jetty_table,
+                    &pending,
+                    &transport_inbound,
+                    local_node_id,
+                    &fabric,
+                ).await;
+            }
+        });
+        self.tasks.push(inbound_handle);
 
         tracing::info!("data plane engine started on {}", self.fabric.local_addr());
         Ok(())
     }
 
     /// Connect to a peer's data plane address.
-    /// This registers the peer for outbound sends via fabric.send_to().
-    /// Responses will arrive through the listener's accept() loop.
+    /// Registers the peer sender with TransportManager and starts the write loop.
     pub async fn connect_peer(&self, node_id: u16, data_addr: std::net::SocketAddr) -> Result<(), UbError> {
-        // Create a sender channel for this peer (for outbound writes)
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
-        self.peer_senders.insert(node_id, tx);
+        self.transport.register_peer_sender(node_id, tx);
 
-        // Write loop: forward messages from channel to peer via fabric socket
         let fabric = Arc::clone(&self.fabric);
         let write_handle = tokio::spawn(async move {
             while let Some(data) = rx.recv().await {
@@ -158,6 +175,21 @@ impl DataPlaneEngine {
         Ok(())
     }
 
+    /// Disconnect from a peer — kill sessions and remove the outbound sender.
+    /// Pending requests to this peer will time out.
+    pub fn disconnect_peer(&self, node_id: u16) {
+        let entries = self.transport.notify_peer_down(node_id);
+        // Fail any pending requests from killed sessions
+        for entry in entries {
+            if !entry.is_fire_and_forget {
+                if let Some((_, tx)) = self.pending_requests.remove(&entry.opaque) {
+                    let _ = tx.send(VerbResponse { status: 4, data: vec![] }); // status 4 = LinkDown
+                }
+            }
+        }
+        tracing::info!("data plane: disconnected from peer {}", node_id);
+    }
+
     /// Remote write (fire-and-forget).
     pub async fn ub_write_remote(
         &self,
@@ -171,10 +203,7 @@ impl DataPlaneEngine {
         let cache_entry = self.mr_cache.lookup_by_addr(addr)
             .ok_or(UbError::AddrInvalid)?;
 
-        let sender = self.peer_senders.get(&cache_entry.owner_node)
-            .ok_or(UbError::LinkDown)?;
-
-        let frame = build_data_frame(
+        let mut frame = build_data_frame(
             self.local_node_id,
             cache_entry.owner_node,
             Verb::Write,
@@ -184,8 +213,9 @@ impl DataPlaneEngine {
             data,
         );
 
-        sender.send(frame.to_vec()).await
-            .map_err(|_| UbError::LinkDown)?;
+        let frame_bytes = frame.to_vec();
+        let mut frame_bytes = frame_bytes;
+        self.transport.send(cache_entry.owner_node, &mut frame_bytes, true, 0)?;
         Ok(())
     }
 
@@ -198,9 +228,6 @@ impl DataPlaneEngine {
         let cache_entry = self.mr_cache.lookup_by_addr(addr)
             .ok_or(UbError::AddrInvalid)?;
 
-        let sender = self.peer_senders.get(&cache_entry.owner_node)
-            .ok_or(UbError::LinkDown)?;
-
         let opaque = self.next_opaque.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending_requests.insert(opaque, tx);
@@ -208,7 +235,7 @@ impl DataPlaneEngine {
         let mut payload = BytesMut::with_capacity(4);
         payload.put_u32(len);
 
-        let frame = build_data_frame(
+        let mut frame = build_data_frame(
             self.local_node_id,
             cache_entry.owner_node,
             Verb::ReadReq,
@@ -218,9 +245,8 @@ impl DataPlaneEngine {
             &payload,
         );
 
-        sender.send(frame.to_vec()).await
-            .map_err(|_| UbError::LinkDown)?;
-        drop(sender); // Release the DashMap reference
+        let mut frame_bytes = frame.to_vec();
+        self.transport.send(cache_entry.owner_node, &mut frame_bytes, false, opaque)?;
 
         match tokio::time::timeout(VERB_TIMEOUT, rx).await {
             Ok(Ok(resp)) => {
@@ -246,9 +272,6 @@ impl DataPlaneEngine {
         let cache_entry = self.mr_cache.lookup_by_addr(addr)
             .ok_or(UbError::AddrInvalid)?;
 
-        let sender = self.peer_senders.get(&cache_entry.owner_node)
-            .ok_or(UbError::LinkDown)?;
-
         let opaque = self.next_opaque.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending_requests.insert(opaque, tx);
@@ -257,7 +280,7 @@ impl DataPlaneEngine {
         payload.put_u64(expect);
         payload.put_u64(new);
 
-        let frame = build_data_frame(
+        let mut frame = build_data_frame(
             self.local_node_id,
             cache_entry.owner_node,
             Verb::AtomicCas,
@@ -267,9 +290,8 @@ impl DataPlaneEngine {
             &payload,
         );
 
-        sender.send(frame.to_vec()).await
-            .map_err(|_| UbError::LinkDown)?;
-        drop(sender);
+        let mut frame_bytes = frame.to_vec();
+        self.transport.send(cache_entry.owner_node, &mut frame_bytes, false, opaque)?;
 
         match tokio::time::timeout(VERB_TIMEOUT, rx).await {
             Ok(Ok(resp)) => {
@@ -299,9 +321,6 @@ impl DataPlaneEngine {
         let cache_entry = self.mr_cache.lookup_by_addr(addr)
             .ok_or(UbError::AddrInvalid)?;
 
-        let sender = self.peer_senders.get(&cache_entry.owner_node)
-            .ok_or(UbError::LinkDown)?;
-
         let opaque = self.next_opaque.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending_requests.insert(opaque, tx);
@@ -309,7 +328,7 @@ impl DataPlaneEngine {
         let mut payload = BytesMut::with_capacity(8);
         payload.put_u64(add);
 
-        let frame = build_data_frame(
+        let mut frame = build_data_frame(
             self.local_node_id,
             cache_entry.owner_node,
             Verb::AtomicFaa,
@@ -319,9 +338,8 @@ impl DataPlaneEngine {
             &payload,
         );
 
-        sender.send(frame.to_vec()).await
-            .map_err(|_| UbError::LinkDown)?;
-        drop(sender);
+        let mut frame_bytes = frame.to_vec();
+        self.transport.send(cache_entry.owner_node, &mut frame_bytes, false, opaque)?;
 
         match tokio::time::timeout(VERB_TIMEOUT, rx).await {
             Ok(Ok(resp)) => {
@@ -353,10 +371,7 @@ impl DataPlaneEngine {
             return Err(UbError::PayloadTooLarge);
         }
 
-        let sender = self.peer_senders.get(&dst_jetty.node_id)
-            .ok_or(UbError::LinkDown)?;
-
-        let frame = build_data_frame_ex(
+        let mut frame = build_data_frame_ex(
             self.local_node_id,
             dst_jetty.node_id,
             Verb::Send,
@@ -369,8 +384,8 @@ impl DataPlaneEngine {
             data,
         );
 
-        sender.send(frame.to_vec()).await
-            .map_err(|_| UbError::LinkDown)?;
+        let mut frame_bytes = frame.to_vec();
+        self.transport.send(dst_jetty.node_id, &mut frame_bytes, true, 0)?;
         Ok(())
     }
 
@@ -386,10 +401,7 @@ impl DataPlaneEngine {
             return Err(UbError::PayloadTooLarge);
         }
 
-        let sender = self.peer_senders.get(&dst_jetty.node_id)
-            .ok_or(UbError::LinkDown)?;
-
-        let frame = build_data_frame_ex(
+        let mut frame = build_data_frame_ex(
             self.local_node_id,
             dst_jetty.node_id,
             Verb::Send,
@@ -402,8 +414,8 @@ impl DataPlaneEngine {
             data,
         );
 
-        sender.send(frame.to_vec()).await
-            .map_err(|_| UbError::LinkDown)?;
+        let mut frame_bytes = frame.to_vec();
+        self.transport.send(dst_jetty.node_id, &mut frame_bytes, true, 0)?;
         Ok(())
     }
 
@@ -423,10 +435,7 @@ impl DataPlaneEngine {
         let cache_entry = self.mr_cache.lookup_by_addr(addr)
             .ok_or(UbError::AddrInvalid)?;
 
-        let sender = self.peer_senders.get(&cache_entry.owner_node)
-            .ok_or(UbError::LinkDown)?;
-
-        let frame = build_data_frame_ex(
+        let mut frame = build_data_frame_ex(
             self.local_node_id,
             cache_entry.owner_node,
             Verb::WriteImm,
@@ -439,8 +448,8 @@ impl DataPlaneEngine {
             data,
         );
 
-        sender.send(frame.to_vec()).await
-            .map_err(|_| UbError::LinkDown)?;
+        let mut frame_bytes = frame.to_vec();
+        self.transport.send(cache_entry.owner_node, &mut frame_bytes, true, 0)?;
         Ok(())
     }
 
@@ -451,45 +460,95 @@ impl DataPlaneEngine {
     pub fn jetty_table(&self) -> &Arc<JettyTable> {
         &self.jetty_table
     }
+
+    pub fn transport(&self) -> &Arc<TransportManager> {
+        &self.transport
+    }
+
+    pub fn local_node_id(&self) -> u16 {
+        self.local_node_id
+    }
 }
 
-/// Handle an incoming frame on a listener session.
-async fn handle_incoming_frame(
-    raw: &[u8],
+/// Handle an inbound frame that passed transport dedup — dispatch to verb handler.
+async fn handle_verb_frame(
+    inbound: InboundFrame,
     mr_table: &MrTable,
     _mr_cache: &MrCacheTable,
     jetty_table: &JettyTable,
     pending: &DashMap<u64, oneshot::Sender<VerbResponse>>,
-    session: &mut Box<dyn Session>,
+    transport: &Arc<TransportManager>,
     local_node_id: u16,
-    _fabric: &Arc<UdpFabric>,
+    fabric: &Arc<UdpFabric>,
 ) {
-    if let Ok((header, ext, payload)) = decode_frame(raw) {
-        if let Some(ref ext_header) = ext {
-            match ext_header.verb {
-                Verb::Write => {
-                    handle_write(payload, ext_header, mr_table);
-                }
-                Verb::ReadReq => {
-                    handle_read_req(payload, ext_header, mr_table, session, local_node_id, &header).await;
-                }
-                Verb::AtomicCas => {
-                    handle_atomic_cas(payload, ext_header, mr_table, session, local_node_id, &header).await;
-                }
-                Verb::AtomicFaa => {
-                    handle_atomic_faa(payload, ext_header, mr_table, session, local_node_id, &header).await;
-                }
-                Verb::Send => {
-                    handle_send(payload, ext_header, jetty_table);
-                }
-                Verb::WriteImm => {
-                    handle_write_imm(payload, ext_header, mr_table, jetty_table);
-                }
-                // Response verbs — complete pending oneshot
-                Verb::ReadResp | Verb::AtomicCasResp | Verb::AtomicFaaResp => {
-                    complete_pending_request(ext_header, payload, pending);
-                }
+    let remote_node = inbound.header.src_node;
+    let seq = inbound.seq;
+
+    match inbound.ext.verb {
+        Verb::Write => {
+            // Check idempotency — skip if already executed
+            if transport.is_executed(remote_node, seq) {
+                return;
             }
+            handle_write(&inbound.payload, &inbound.ext, mr_table);
+            transport.mark_executed(remote_node, seq);
+        }
+        Verb::ReadReq => {
+            // Check read cache for idempotent response
+            let cache_key = (remote_node, inbound.ext.opaque);
+            if let Some(cached_response) = transport.read_cache_get(remote_node, cache_key) {
+                // Resend cached response via transport
+                transport.send_frame_to_peer(remote_node, &cached_response);
+                return;
+            }
+            handle_read_req(
+                &inbound.payload, &inbound.ext, mr_table, fabric, local_node_id,
+                &inbound.header, transport, remote_node, cache_key,
+            ).await;
+        }
+        Verb::AtomicCas => {
+            // Check if already executed — if so, resend cached response
+            if transport.is_executed(remote_node, seq) {
+                let cache_key = (remote_node, inbound.ext.opaque);
+                if let Some(cached_response) = transport.read_cache_get(remote_node, cache_key) {
+                    transport.send_frame_to_peer(remote_node, &cached_response);
+                }
+                return;
+            }
+            handle_atomic_cas(
+                &inbound.payload, &inbound.ext, mr_table, fabric, local_node_id,
+                &inbound.header, transport, remote_node,
+            ).await;
+            transport.mark_executed(remote_node, seq);
+        }
+        Verb::AtomicFaa => {
+            // Check if already executed — if so, resend cached response
+            if transport.is_executed(remote_node, seq) {
+                let cache_key = (remote_node, inbound.ext.opaque);
+                if let Some(cached_response) = transport.read_cache_get(remote_node, cache_key) {
+                    transport.send_frame_to_peer(remote_node, &cached_response);
+                }
+                return;
+            }
+            handle_atomic_faa(
+                &inbound.payload, &inbound.ext, mr_table, fabric, local_node_id,
+                &inbound.header, transport, remote_node,
+            ).await;
+            transport.mark_executed(remote_node, seq);
+        }
+        Verb::Send => {
+            handle_send(&inbound.payload, &inbound.ext, jetty_table);
+        }
+        Verb::WriteImm => {
+            if transport.is_executed(remote_node, seq) {
+                return;
+            }
+            handle_write_imm(&inbound.payload, &inbound.ext, mr_table, jetty_table);
+            transport.mark_executed(remote_node, seq);
+        }
+        // Response verbs — complete pending oneshot
+        Verb::ReadResp | Verb::AtomicCasResp | Verb::AtomicFaaResp => {
+            complete_pending_request(&inbound.ext, &inbound.payload, pending, transport, remote_node);
         }
     }
 }
@@ -528,20 +587,23 @@ async fn handle_read_req(
     payload: &[u8],
     ext: &DataExtHeader,
     mr_table: &MrTable,
-    session: &mut Box<dyn Session>,
+    _fabric: &Arc<UdpFabric>,
     local_node_id: u16,
     header: &FrameHeader,
+    transport: &Arc<TransportManager>,
+    remote_node: u16,
+    cache_key: (u16, u64),
 ) {
     let entry = match mr_table.lookup(ext.mr_handle) {
         Some(e) => e,
         None => {
-            send_error_response(session, local_node_id, header.src_node, ext, 1).await;
+            send_error_response(transport, local_node_id, header.src_node, ext, 1);
             return;
         }
     };
 
     if entry.check_perms(Verb::ReadReq).is_err() {
-        send_error_response(session, local_node_id, header.src_node, ext, 2).await;
+        send_error_response(transport, local_node_id, header.src_node, ext, 2);
         return;
     }
 
@@ -570,10 +632,13 @@ async fn handle_read_req(
                 ext.opaque,
                 &buf,
             );
-            let _ = session.send(&resp_frame).await;
+            let resp_bytes = resp_frame.to_vec();
+            // Cache the response for idempotent re-read
+            transport.read_cache_insert(remote_node, cache_key, resp_bytes.clone());
+            transport.send_frame_to_peer(remote_node, &resp_bytes);
         }
         Err(_) => {
-            send_error_response(session, local_node_id, header.src_node, ext, 1).await;
+            send_error_response(transport, local_node_id, header.src_node, ext, 1);
         }
     }
 }
@@ -582,20 +647,22 @@ async fn handle_atomic_cas(
     payload: &[u8],
     ext: &DataExtHeader,
     mr_table: &MrTable,
-    session: &mut Box<dyn Session>,
+    _fabric: &Arc<UdpFabric>,
     local_node_id: u16,
     header: &FrameHeader,
+    transport: &Arc<TransportManager>,
+    remote_node: u16,
 ) {
     let entry = match mr_table.lookup(ext.mr_handle) {
         Some(e) => e,
         None => {
-            send_error_response(session, local_node_id, header.src_node, ext, 1).await;
+            send_error_response(transport, local_node_id, header.src_node, ext, 1);
             return;
         }
     };
 
     if entry.check_perms(Verb::AtomicCas).is_err() {
-        send_error_response(session, local_node_id, header.src_node, ext, 2).await;
+        send_error_response(transport, local_node_id, header.src_node, ext, 2);
         return;
     }
 
@@ -605,14 +672,14 @@ async fn handle_atomic_cas(
         0
     };
     if offset_in_mr % 8 != 0 {
-        send_error_response(session, local_node_id, header.src_node, ext, 3).await;
+        send_error_response(transport, local_node_id, header.src_node, ext, 3);
         return;
     }
 
     let device_offset = entry.base_offset + offset_in_mr;
 
     if payload.len() < 16 {
-        send_error_response(session, local_node_id, header.src_node, ext, 9).await;
+        send_error_response(transport, local_node_id, header.src_node, ext, 9);
         return;
     }
     let expect = u64::from_be_bytes(payload[..8].try_into().unwrap());
@@ -634,10 +701,13 @@ async fn handle_atomic_cas(
                 ext.opaque,
                 &resp_payload,
             );
-            let _ = session.send(&resp_frame).await;
+            // Cache the response for retransmission on duplicate requests
+            let cache_key = (remote_node, ext.opaque);
+            transport.read_cache_insert(remote_node, cache_key, resp_frame.to_vec());
+            transport.send_frame_to_peer(remote_node, &resp_frame);
         }
         Err(_) => {
-            send_error_response(session, local_node_id, header.src_node, ext, 9).await;
+            send_error_response(transport, local_node_id, header.src_node, ext, 9);
         }
     }
 }
@@ -646,20 +716,22 @@ async fn handle_atomic_faa(
     payload: &[u8],
     ext: &DataExtHeader,
     mr_table: &MrTable,
-    session: &mut Box<dyn Session>,
+    _fabric: &Arc<UdpFabric>,
     local_node_id: u16,
     header: &FrameHeader,
+    transport: &Arc<TransportManager>,
+    remote_node: u16,
 ) {
     let entry = match mr_table.lookup(ext.mr_handle) {
         Some(e) => e,
         None => {
-            send_error_response(session, local_node_id, header.src_node, ext, 1).await;
+            send_error_response(transport, local_node_id, header.src_node, ext, 1);
             return;
         }
     };
 
     if entry.check_perms(Verb::AtomicFaa).is_err() {
-        send_error_response(session, local_node_id, header.src_node, ext, 2).await;
+        send_error_response(transport, local_node_id, header.src_node, ext, 2);
         return;
     }
 
@@ -669,14 +741,14 @@ async fn handle_atomic_faa(
         0
     };
     if offset_in_mr % 8 != 0 {
-        send_error_response(session, local_node_id, header.src_node, ext, 3).await;
+        send_error_response(transport, local_node_id, header.src_node, ext, 3);
         return;
     }
 
     let device_offset = entry.base_offset + offset_in_mr;
 
     if payload.len() < 8 {
-        send_error_response(session, local_node_id, header.src_node, ext, 9).await;
+        send_error_response(transport, local_node_id, header.src_node, ext, 9);
         return;
     }
     let add = u64::from_be_bytes(payload[..8].try_into().unwrap());
@@ -697,10 +769,13 @@ async fn handle_atomic_faa(
                 ext.opaque,
                 &resp_payload,
             );
-            let _ = session.send(&resp_frame).await;
+            // Cache the response for retransmission on duplicate requests
+            let cache_key = (remote_node, ext.opaque);
+            transport.read_cache_insert(remote_node, cache_key, resp_frame.to_vec());
+            transport.send_frame_to_peer(remote_node, &resp_frame);
         }
         Err(_) => {
-            send_error_response(session, local_node_id, header.src_node, ext, 9).await;
+            send_error_response(transport, local_node_id, header.src_node, ext, 9);
         }
     }
 }
@@ -709,6 +784,8 @@ fn complete_pending_request(
     ext: &DataExtHeader,
     payload: &[u8],
     pending: &DashMap<u64, oneshot::Sender<VerbResponse>>,
+    transport: &TransportManager,
+    remote_node: u16,
 ) {
     if let Some((_, sender)) = pending.remove(&ext.opaque) {
         let is_error = ext.ext_flags.contains(ExtFlags::ERR_RESP);
@@ -721,6 +798,10 @@ fn complete_pending_request(
         let data = if is_error { Vec::new() } else { payload.to_vec() };
 
         let _ = sender.send(VerbResponse { status, data });
+
+        // Remove the request-response entry from the retransmit queue
+        // now that we've received the response.
+        transport.complete_request(remote_node, ext.opaque);
     }
 }
 
@@ -820,8 +901,8 @@ fn handle_write_imm(
     }
 }
 
-async fn send_error_response(
-    session: &mut Box<dyn Session>,
+fn send_error_response(
+    transport: &TransportManager,
     local_node_id: u16,
     dst_node: u16,
     req_ext: &DataExtHeader,
@@ -841,7 +922,7 @@ async fn send_error_response(
         ExtFlags::ERR_RESP,
     );
 
-    let _ = session.send(&resp_frame).await;
+    transport.send_frame_to_peer(dst_node, &resp_frame);
 }
 
 fn build_data_frame(
@@ -963,7 +1044,7 @@ fn status_to_error(status: u32) -> UbError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ub_core::config::JettyConfig;
+    use ub_core::config::{FlowConfig, JettyConfig, TransportConfig};
     use ub_core::device::memory::MemoryDevice;
     use ub_core::jetty::JettyTable;
     use ub_core::types::{DeviceKind, MrPerms};
@@ -975,6 +1056,61 @@ mod tests {
             jfc_depth: 16,
             jfc_high_watermark: 12,
         }
+    }
+
+    fn test_transport_config() -> (TransportConfig, FlowConfig) {
+        (
+            TransportConfig {
+                rto_ms: 200,
+                max_retries: 8,
+                sack_bitmap_bits: 256,
+                reassembly_budget_bytes: 67108864,
+            },
+            FlowConfig {
+                initial_credits: 64,
+            },
+        )
+    }
+
+    /// Helper to create a DataPlaneEngine with transport wired up.
+    fn make_engine(
+        node_id: u16,
+        mr_table: Arc<MrTable>,
+        mr_cache: Arc<MrCacheTable>,
+        jetty_table: Arc<JettyTable>,
+        fabric: Arc<UdpFabric>,
+    ) -> DataPlaneEngine {
+        let (tconfig, fconfig) = test_transport_config();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let transport = Arc::new(TransportManager::new(node_id, tconfig, fconfig, inbound_tx));
+        DataPlaneEngine::new(node_id, mr_table, mr_cache, jetty_table, fabric, transport, inbound_rx)
+    }
+
+    /// Helper to create a DataPlaneEngine with transport wired up AND RTO task started.
+    fn make_engine_with_rto(
+        node_id: u16,
+        mr_table: Arc<MrTable>,
+        mr_cache: Arc<MrCacheTable>,
+        jetty_table: Arc<JettyTable>,
+        fabric: Arc<UdpFabric>,
+    ) -> DataPlaneEngine {
+        let (tconfig, fconfig) = test_transport_config();
+        let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+        let mut transport = TransportManager::new(node_id, tconfig, fconfig, inbound_tx);
+        transport.start_rto_task();
+        let transport = Arc::new(transport);
+        DataPlaneEngine::new(node_id, mr_table, mr_cache, jetty_table, fabric, transport, inbound_rx)
+    }
+
+    /// Helper to bidirectionally connect two engines.
+    async fn connect_bidir(
+        engine_a: &DataPlaneEngine,
+        engine_b: &DataPlaneEngine,
+    ) {
+        let addr_a = engine_a.fabric.local_addr();
+        let addr_b = engine_b.fabric.local_addr();
+        engine_a.connect_peer(engine_b.local_node_id(), addr_b).await.unwrap();
+        engine_b.connect_peer(engine_a.local_node_id(), addr_a).await.unwrap();
     }
 
     #[test]
@@ -1021,14 +1157,17 @@ mod tests {
             device_kind: DeviceKind::Memory,
         });
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
+
+        // Create sessions and register peer senders before starting
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1066,14 +1205,16 @@ mod tests {
             device_kind: DeviceKind::Memory,
         });
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1118,14 +1259,16 @@ mod tests {
             device_kind: DeviceKind::Memory,
         });
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::new(JettyTable::new(1, test_jetty_config())), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::new(JettyTable::new(2, test_jetty_config())), fabric_b);
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1144,7 +1287,6 @@ mod tests {
 
         // Collect results
         let mut success_count = 0;
-        let mut winner_id = 0u64;
         for handle in handles {
             match handle.await.unwrap() {
                 Ok(old) => {
@@ -1153,7 +1295,6 @@ mod tests {
                     }
                 }
                 Err(e) => {
-                    // Timeout or other error is acceptable in concurrent scenario
                     eprintln!("CAS error: {e}");
                 }
             }
@@ -1166,16 +1307,14 @@ mod tests {
             (1..=8).contains(&final_value),
             "Final value should be a task ID, got {final_value}"
         );
-        winner_id = final_value;
 
-        // At least one CAS should succeed (exactly one if serialization works correctly)
         assert!(
             success_count >= 1,
             "At least one CAS should succeed (got {success_count})"
         );
         assert!(
             success_count <= 1,
-            "At most one CAS should succeed with old=0 (got {success_count}, winner={winner_id})"
+            "At most one CAS should succeed with old=0 (got {success_count})"
         );
     }
 
@@ -1210,14 +1349,16 @@ mod tests {
         let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
         let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1257,14 +1398,16 @@ mod tests {
         let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
         let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1308,14 +1451,16 @@ mod tests {
         let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
         let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1356,14 +1501,16 @@ mod tests {
         let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
         let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1371,22 +1518,18 @@ mod tests {
         let jetty_handle_a = jetty_table_a.create().unwrap();
         let jetty_a = jetty_table_a.lookup(jetty_handle_a.0).unwrap();
 
-        // Post recv with different wr_ids so we can identify ordering
-        jetty_a.post_recv(vec![0u8; 64], 100).unwrap(); // first recv
-        jetty_a.post_recv(vec![0u8; 64], 101).unwrap(); // second recv
+        jetty_a.post_recv(vec![0u8; 64], 100).unwrap();
+        jetty_a.post_recv(vec![0u8; 64], 101).unwrap();
 
-        // Create Jetty on B for src
         let jetty_handle_b = jetty_table_b.create().unwrap();
 
         let dst_jetty = JettyAddr { node_id: 1, jetty_id: jetty_handle_a.0 };
 
-        // Send message 1 then message 2
         engine_b.ub_send_remote(jetty_handle_b.0, dst_jetty, &[1]).await.unwrap();
         engine_b.ub_send_remote(jetty_handle_b.0, dst_jetty, &[2]).await.unwrap();
 
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // First CQE should be for wr_id=100, second for wr_id=101
         let cqe1 = jetty_a.poll_cqe().expect("first CQE");
         let cqe2 = jetty_a.poll_cqe().expect("second CQE");
 
@@ -1408,18 +1551,19 @@ mod tests {
         let jetty_table_a = Arc::new(JettyTable::new(1, test_jetty_config()));
         let jetty_table_b = Arc::new(JettyTable::new(2, test_jetty_config()));
 
-        let mut engine_a = DataPlaneEngine::new(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
-        let mut engine_b = DataPlaneEngine::new(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+        let mut engine_a = make_engine(1, Arc::clone(&mr_table_a), mr_cache_a, Arc::clone(&jetty_table_a), fabric_a);
+        let mut engine_b = make_engine(2, mr_table_b, mr_cache_b, Arc::clone(&jetty_table_b), fabric_b);
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
 
         engine_a.start().await.unwrap();
         engine_b.start().await.unwrap();
 
-        let addr_a_dp = engine_a.fabric.local_addr();
-        engine_b.connect_peer(1, addr_a_dp).await.unwrap();
+        connect_bidir(&engine_a, &engine_b).await;
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Create Jetty on A, post 4 recv buffers
         let jetty_handle_a = jetty_table_a.create().unwrap();
         let jetty_a = jetty_table_a.lookup(jetty_handle_a.0).unwrap();
         for i in 0..4u64 {
@@ -1429,7 +1573,6 @@ mod tests {
         let jetty_handle_b = jetty_table_b.create().unwrap();
         let dst_jetty = JettyAddr { node_id: 1, jetty_id: jetty_handle_a.0 };
 
-        // Send 4 messages concurrently from B
         let mut handles = Vec::new();
         for i in 0..4u8 {
             let engine = engine_b.clone();
@@ -1445,11 +1588,143 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        // All 4 CQEs should eventually arrive
         let mut cqe_count = 0;
         while jetty_a.poll_cqe().is_some() {
             cqe_count += 1;
         }
         assert_eq!(cqe_count, 4, "all 4 concurrent sends should produce CQEs");
+    }
+
+    /// M4.8: Loss resilience integration test.
+    /// Uses UdpFabric::bind_with_loss with 1% packet loss injection.
+    /// Verifies that Write+Read and AtomicFAA operations all succeed
+    /// (thanks to RTO retransmission) and data is correct (at-most-once semantics).
+    #[tokio::test]
+    async fn test_loss_resilience_write_read_and_atomic() {
+        let loss_rate = 0.01;
+
+        let fabric_a = Arc::new(
+            UdpFabric::bind_with_loss("127.0.0.1:0".parse().unwrap(), loss_rate)
+                .await
+                .unwrap(),
+        );
+        let fabric_b = Arc::new(
+            UdpFabric::bind_with_loss("127.0.0.1:0".parse().unwrap(), loss_rate)
+                .await
+                .unwrap(),
+        );
+
+        let mr_table_a = Arc::new(MrTable::new(1, 1));
+        let mr_cache_a = Arc::new(MrCacheTable::new());
+        let mr_table_b = Arc::new(MrTable::new(1, 2));
+        let mr_cache_b = Arc::new(MrCacheTable::new());
+
+        let dev = Arc::new(MemoryDevice::new(65536));
+        let (addr_a, handle_a) = mr_table_a
+            .register(dev, 65536, MrPerms::READ | MrPerms::WRITE | MrPerms::ATOMIC)
+            .unwrap();
+
+        mr_cache_b.insert(ub_core::mr::MrCacheEntry {
+            remote_mr_handle: handle_a.0,
+            owner_node: 1,
+            base_ub_addr: addr_a,
+            len: 65536,
+            perms: MrPerms::READ | MrPerms::WRITE | MrPerms::ATOMIC,
+            device_kind: DeviceKind::Memory,
+        });
+
+        // Use make_engine_with_rto so RTO retransmission is active
+        let mut engine_a = make_engine_with_rto(
+            1,
+            Arc::clone(&mr_table_a),
+            mr_cache_a,
+            Arc::new(JettyTable::new(1, test_jetty_config())),
+            fabric_a,
+        );
+        let mut engine_b = make_engine_with_rto(
+            2,
+            mr_table_b,
+            Arc::clone(&mr_cache_b),
+            Arc::new(JettyTable::new(2, test_jetty_config())),
+            fabric_b,
+        );
+
+        engine_a.transport().create_session(2, 1, 64).unwrap();
+        engine_b.transport().create_session(1, 1, 64).unwrap();
+
+        engine_a.start().await.unwrap();
+        engine_b.start().await.unwrap();
+
+        connect_bidir(&engine_a, &engine_b).await;
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // === Phase 1: 100 Write + Read ===
+        let write_count = 100u64;
+        for i in 0..write_count {
+            let write_data = vec![(i as u8); 4];
+            engine_b
+                .ub_write_remote(addr_a, &write_data)
+                .await
+                .unwrap_or_else(|e| panic!("write {} failed: {e}", i));
+
+            // Read back every 10th write to verify data delivery
+            if i % 10 == 9 {
+                let read_data = engine_b
+                    .ub_read_remote(addr_a, 4)
+                    .await
+                    .unwrap_or_else(|e| panic!("read after write {} failed: {e}", i));
+                assert_eq!(read_data.len(), 4, "read after write {} should return 4 bytes", i);
+            }
+
+            // Yield periodically to allow ACK/credit processing
+            if i % 10 == 9 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // Allow time for fire-and-forget writes to be delivered
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // === Phase 2: 50 AtomicCAS ===
+        // Initialize the MR base to 0 for atomic operations
+        engine_b
+            .ub_write_remote(addr_a, &0u64.to_ne_bytes())
+            .await
+            .expect("initializing atomic region should succeed");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Use FAA to count from 0 to 50 — each FAA returns the old value
+        let faa_count = 50u64;
+        let mut faa_results = Vec::new();
+        for i in 0..faa_count {
+            let old = engine_b
+                .ub_atomic_faa_remote(addr_a, 1)
+                .await
+                .unwrap_or_else(|e| panic!("FAA {} failed: {e}", i));
+            faa_results.push(old);
+
+            // Yield periodically to prevent retransmit queue buildup
+            if i % 10 == 9 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        // Verify all FAA old values are distinct and form a contiguous range [0, 50)
+        // This proves at-most-once semantics: no FAA was executed twice
+        faa_results.sort();
+        let expected: Vec<u64> = (0..faa_count).collect();
+        assert_eq!(
+            faa_results, expected,
+            "FAA results should be exactly [0, {}) — at-most-once semantics", faa_count
+        );
+
+        // Final value should be faa_count
+        let final_read = engine_b
+            .ub_read_remote(addr_a, 8)
+            .await
+            .expect("final read should succeed");
+        let final_value = u64::from_ne_bytes(final_read[..8].try_into().unwrap());
+        assert_eq!(final_value, faa_count, "final atomic value should be {}", faa_count);
     }
 }

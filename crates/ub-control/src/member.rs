@@ -208,6 +208,24 @@ mod tests {
     }
 
     #[test]
+    fn test_member_table_mark_suspect_only_from_active() {
+        let table = MemberTable::new(1);
+        table.upsert(NodeInfo {
+            node_id: 2,
+            state: NodeState::Down,
+            control_addr: "".to_string(),
+            data_addr: "".to_string(),
+            epoch: 0,
+            initial_credits: 0,
+            last_seen: None,
+            tx: None,
+        });
+        // mark_suspect should NOT transition from Down to Suspect
+        table.mark_suspect(2);
+        assert_eq!(table.get(2).unwrap().state, NodeState::Down);
+    }
+
+    #[test]
     fn test_member_table_active_peers() {
         let table = MemberTable::new(1);
         table.upsert(NodeInfo {

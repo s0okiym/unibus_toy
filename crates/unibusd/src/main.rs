@@ -13,9 +13,10 @@ use ub_core::config::NodeConfig;
 use ub_core::device::memory::MemoryDevice;
 use ub_core::device::Device;
 use ub_core::mr::{MrCacheTable, MrTable};
-use ub_core::types::{JettyAddr, MrPerms};
+use ub_core::types::{JettyAddr, MrPerms, PeerChangeEvent};
 use ub_dataplane::DataPlaneEngine;
 use ub_fabric::udp::UdpFabric;
+use ub_transport::manager::TransportManager;
 
 #[derive(Parser)]
 #[command(name = "unibusd", about = "UniBus daemon")]
@@ -143,12 +144,24 @@ async fn main() {
         .expect("invalid data listen address");
     let fabric = Arc::new(UdpFabric::bind(data_listen).await.expect("failed to bind data plane UDP socket"));
     let jetty_table = Arc::new(ub_core::jetty::JettyTable::new(config.node_id, config.jetty.clone()));
+
+    // Create transport manager
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+    let transport = Arc::new(TransportManager::new(
+        config.node_id,
+        config.transport.clone(),
+        config.flow.clone(),
+        inbound_tx,
+    ));
+
     let mut dataplane = DataPlaneEngine::new(
         config.node_id,
         Arc::clone(&mr_table),
         Arc::clone(&mr_cache),
         Arc::clone(&jetty_table),
         fabric,
+        Arc::clone(&transport),
+        inbound_rx,
     );
     dataplane.start().await.expect("failed to start data plane");
 
@@ -158,19 +171,49 @@ async fn main() {
     let peer_change_rx = control.peer_change_rx.clone();
     let members_dp = Arc::clone(&members);
     let dataplane_peer = Arc::clone(&dataplane);
+    let transport_peer = Arc::clone(&transport);
     tokio::spawn(async move {
         let mut rx = peer_change_rx;
         while rx.changed().await.is_ok() {
-            let node_id = *rx.borrow();
-            if node_id == 0 {
-                continue;
-            }
-            if let Some(node) = members_dp.get(node_id) {
-                if let Ok(data_addr) = node.data_addr.parse::<std::net::SocketAddr>() {
-                    let dp = dataplane_peer.lock().await;
-                    if let Err(e) = dp.connect_peer(node_id, data_addr).await {
-                        tracing::warn!("data plane: failed to connect to peer {}: {e}", node_id);
+            let event = rx.borrow().clone();
+            match event {
+                PeerChangeEvent::Joined { node_id, epoch } => {
+                    if node_id == 0 {
+                        continue;
                     }
+                    if let Some(node) = members_dp.get(node_id) {
+                        if let Ok(data_addr) = node.data_addr.parse::<std::net::SocketAddr>() {
+                            // Create transport session for this peer
+                            let initial_credits = node.initial_credits;
+                            if let Err(e) = transport_peer.create_session(node_id, epoch, initial_credits) {
+                                tracing::warn!("transport: failed to create session for peer {}: {e}", node_id);
+                            }
+                            // Connect data plane
+                            let dp = dataplane_peer.lock().await;
+                            if let Err(e) = dp.connect_peer(node_id, data_addr).await {
+                                tracing::warn!("data plane: failed to connect to peer {}: {e}", node_id);
+                            }
+                        }
+                    }
+                }
+                PeerChangeEvent::Recovered { node_id } => {
+                    tracing::info!("data plane: peer {} recovered to Active", node_id);
+                    if let Some(node) = members_dp.get(node_id) {
+                        if let Ok(data_addr) = node.data_addr.parse::<std::net::SocketAddr>() {
+                            let dp = dataplane_peer.lock().await;
+                            if let Err(e) = dp.connect_peer(node_id, data_addr).await {
+                                tracing::warn!("data plane: failed to reconnect to peer {}: {e}", node_id);
+                            }
+                        }
+                    }
+                }
+                PeerChangeEvent::Suspect { node_id } => {
+                    tracing::warn!("data plane: peer {} is Suspect", node_id);
+                }
+                PeerChangeEvent::Down { node_id, epoch: _ } => {
+                    tracing::warn!("data plane: peer {} is Down, disconnecting", node_id);
+                    let dp = dataplane_peer.lock().await;
+                    dp.disconnect_peer(node_id);
                 }
             }
         }

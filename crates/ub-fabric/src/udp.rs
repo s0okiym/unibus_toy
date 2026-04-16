@@ -23,10 +23,17 @@ pub struct UdpFabric {
     pending: Arc<DashMap<SocketAddr, Vec<BytesMut>>>,
     new_peer_tx: mpsc::UnboundedSender<SocketAddr>,
     new_peer_rx: Arc<Mutex<mpsc::UnboundedReceiver<SocketAddr>>>,
+    /// Loss rate for testing (0.0 = no loss, 1.0 = all dropped).
+    loss_rate: f64,
 }
 
 impl UdpFabric {
     pub async fn bind(addr: SocketAddr) -> Result<Self, UbError> {
+        Self::bind_with_loss(addr, 0.0).await
+    }
+
+    /// Bind with an optional loss rate for testing. `loss_rate` is 0.0–1.0.
+    pub async fn bind_with_loss(addr: SocketAddr, loss_rate: f64) -> Result<Self, UbError> {
         let socket = UdpSocket::bind(addr).await?;
         let (new_peer_tx, new_peer_rx) = mpsc::unbounded_channel();
         let demux: Arc<DashMap<SocketAddr, mpsc::Sender<BytesMut>>> = Arc::new(DashMap::new());
@@ -38,11 +45,16 @@ impl UdpFabric {
         let demux_clone = Arc::clone(&demux);
         let pending_clone = Arc::clone(&pending);
         let tx_clone = new_peer_tx.clone();
+        let inject_loss = loss_rate > 0.0;
         tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_RECV_BUF_SIZE];
             loop {
                 match sock.recv_from(&mut buf).await {
                     Ok((len, src_addr)) => {
+                        // Loss injection: drop packet with probability loss_rate
+                        if inject_loss && rand::random::<f64>() < loss_rate {
+                            continue;
+                        }
                         let pkt = BytesMut::from(&buf[..len]);
                         if let Some(sender) = demux_clone.get(&src_addr) {
                             if sender.send(pkt).await.is_err() {
@@ -73,6 +85,7 @@ impl UdpFabric {
             pending,
             new_peer_tx,
             new_peer_rx: Arc::new(Mutex::new(new_peer_rx)),
+            loss_rate,
         })
     }
 

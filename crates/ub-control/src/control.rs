@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use ub_core::config::NodeConfig;
 use ub_core::error::UbError;
 use ub_core::mr::{MrCacheTable, MrPublishEvent, MrTable};
-use ub_core::types::NodeState;
+use ub_core::types::{NodeState, PeerChangeEvent};
 
 use crate::member::{MemberTable, NodeInfo};
 use crate::message::{ControlMsg, HelloPayload, HeartbeatPayload, MemberDownPayload, MrPublishPayload, MrRevokePayload};
@@ -25,9 +25,9 @@ pub struct ControlPlane {
     local_epoch: u32,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
-    /// Watch channel for notifying data plane about new peers.
-    peer_change_tx: watch::Sender<u16>,
-    pub peer_change_rx: watch::Receiver<u16>,
+    /// Watch channel for notifying data plane about peer state changes.
+    peer_change_tx: watch::Sender<PeerChangeEvent>,
+    pub peer_change_rx: watch::Receiver<PeerChangeEvent>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -35,7 +35,7 @@ impl ControlPlane {
     pub fn new(config: Arc<NodeConfig>, members: Arc<MemberTable>, mr_cache: Arc<MrCacheTable>) -> Self {
         let local_epoch = rand::random::<u32>();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (peer_change_tx, peer_change_rx) = watch::channel(0);
+        let (peer_change_tx, peer_change_rx) = watch::channel(PeerChangeEvent::Joined { node_id: 0, epoch: 0 });
         ControlPlane {
             config,
             members,
@@ -229,6 +229,7 @@ impl ControlPlane {
         let interval_ms = self.config.heartbeat.interval_ms;
         let fail_after = self.config.heartbeat.fail_after;
         let mut shutdown_rx_hb = self.shutdown_rx.clone();
+        let peer_change_tx_hb = self.peer_change_tx.clone();
 
         let hb_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
@@ -264,14 +265,33 @@ impl ControlPlane {
                                     let count = missed_count.entry(node.node_id).or_insert(0);
                                     *count += 1;
                                     if *count >= fail_after {
-                                        tracing::warn!("node {} missed {} heartbeats, marking as down", node.node_id, fail_after);
-                                        members_hb.mark_suspect(node.node_id);
+                                        if node.state == NodeState::Active {
+                                            tracing::warn!("node {} missed {} heartbeats, marking as suspect", node.node_id, fail_after);
+                                            members_hb.mark_suspect(node.node_id);
+                                            let _ = peer_change_tx_hb.send(PeerChangeEvent::Suspect {
+                                                node_id: node.node_id,
+                                            });
+                                        }
                                         if *count >= fail_after * 2 {
+                                            tracing::warn!("node {} missed {} heartbeats, marking as down", node.node_id, fail_after * 2);
                                             members_hb.mark_down(node.node_id);
+                                            let _ = peer_change_tx_hb.send(PeerChangeEvent::Down {
+                                                node_id: node.node_id,
+                                                epoch: node.epoch,
+                                            });
                                         }
                                     }
                                 } else {
-                                    missed_count.remove(&node.node_id);
+                                    // Heartbeat received — recover from Suspect if needed
+                                    if missed_count.remove(&node.node_id).is_some() {
+                                        if node.state == NodeState::Suspect {
+                                            tracing::info!("node {} heartbeat resumed, recovering to Active", node.node_id);
+                                            members_hb.mark_active(node.node_id);
+                                            let _ = peer_change_tx_hb.send(PeerChangeEvent::Recovered {
+                                                node_id: node.node_id,
+                                            });
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -309,7 +329,7 @@ async fn handle_peer_connection(
     mr_cache: Arc<MrCacheTable>,
     mr_table: Option<Arc<MrTable>>,
     _is_incoming: bool,
-    peer_change_tx: watch::Sender<u16>,
+    peer_change_tx: watch::Sender<PeerChangeEvent>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
@@ -407,7 +427,7 @@ async fn process_control_message(
     mr_table: &Option<Arc<MrTable>>,
     peer_tx: &mpsc::Sender<Vec<u8>>,
     local_epoch: u32,
-    peer_change_tx: &watch::Sender<u16>,
+    peer_change_tx: &watch::Sender<PeerChangeEvent>,
 ) {
     match msg {
         ControlMsg::Hello(hello) => {
@@ -443,7 +463,10 @@ async fn process_control_message(
             send_existing_mrs(mr_table, peer_tx).await;
 
             // Notify data plane about new peer
-            let _ = peer_change_tx.send(hello.node_id);
+            let _ = peer_change_tx.send(PeerChangeEvent::Joined {
+                node_id: hello.node_id,
+                epoch: hello.local_epoch,
+            });
         }
         ControlMsg::HelloAck(hello) => {
             tracing::info!(
@@ -466,7 +489,10 @@ async fn process_control_message(
             send_existing_mrs(mr_table, peer_tx).await;
 
             // Notify data plane about new peer
-            let _ = peer_change_tx.send(hello.node_id);
+            let _ = peer_change_tx.send(PeerChangeEvent::Joined {
+                node_id: hello.node_id,
+                epoch: hello.local_epoch,
+            });
         }
         ControlMsg::Heartbeat(hb) => {
             members.update_last_seen(hb.node_id, now_millis());
@@ -484,6 +510,11 @@ async fn process_control_message(
         ControlMsg::MemberDown(md) => {
             tracing::info!("MEMBER_DOWN: node {} reason={}", md.node_id, md.reason);
             members.mark_down(md.node_id);
+            let epoch = members.get(md.node_id).map(|n| n.epoch).unwrap_or(0);
+            let _ = peer_change_tx.send(PeerChangeEvent::Down {
+                node_id: md.node_id,
+                epoch,
+            });
         }
         ControlMsg::MrPublish(mr) => {
             tracing::info!(
@@ -551,5 +582,30 @@ mod tests {
     fn test_now_millis() {
         let t = now_millis();
         assert!(t > 0);
+    }
+
+    #[tokio::test]
+    async fn test_peer_change_event_channel() {
+        let (tx, mut rx) = watch::channel(PeerChangeEvent::Joined { node_id: 0, epoch: 0 });
+
+        // Send Joined event
+        tx.send(PeerChangeEvent::Joined { node_id: 2, epoch: 100 }).unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), PeerChangeEvent::Joined { node_id: 2, epoch: 100 });
+
+        // Send Suspect event
+        tx.send(PeerChangeEvent::Suspect { node_id: 2 }).unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), PeerChangeEvent::Suspect { node_id: 2 });
+
+        // Send Recovered event
+        tx.send(PeerChangeEvent::Recovered { node_id: 2 }).unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), PeerChangeEvent::Recovered { node_id: 2 });
+
+        // Send Down event
+        tx.send(PeerChangeEvent::Down { node_id: 2, epoch: 100 }).unwrap();
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), PeerChangeEvent::Down { node_id: 2, epoch: 100 });
     }
 }

@@ -11,3 +11,6 @@ ub-obs = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+byteorder = { workspace = true }
