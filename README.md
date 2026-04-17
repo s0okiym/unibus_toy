@@ -49,30 +49,379 @@ AI 大模型时代，"Scale-Up 域"（一个紧耦合的计算单元集合，对
 
 ## 架构
 
-```
-┌─────────────────────────────────────────────────────┐
-│ Application                                         │
-│  ├─ 分布式 KV demo（verbs 层版，M5 交付）           │
-│  └─ 3 节点 KV cache demo（managed 层版，M7 交付）   │
-├─────────────────────────────────────────────────────┤
-│ ub-managed  (M7)                                    │
-│   Global allocator · Placer · Region table          │
-│   Coherence SM · Cache tier · LRU eviction          │
-├─────────────────────────────────────────────────────┤
-│ ub-core  verbs / jetty / mr / addr / device         │
-├─────────────────────────────────────────────────────┤
-│ ub-transport   序号 · ACK/SACK · 重传 · 流控        │
-├─────────────────────────────────────────────────────┤
-│ ub-fabric      UDP Fabric trait 实现                │
-└─────────────────────────────────────────────────────┘
-          ▲
-          │ ub-control   hub · 心跳 · MR 目录 · 成员关系
+### 分层架构图
+
+```mermaid
+graph TB
+    subgraph "Application Layer"
+        APP_KV["分布式 KV Demo<br/>(Verbs 层版, M5)"]
+        APP_CACHE["3 节点 KV Cache Demo<br/>(Managed 层版, M7)"]
+    end
+
+    subgraph "Managed Layer (ub-managed, M7)"
+        GVA["Global Allocator"]
+        PLACER["Placer"]
+        RTABLE["Region Table"]
+        COH["Coherence SM<br/>(SWMR)"]
+        CACHE["Cache Pool<br/>(LRU Eviction)"]
+        FETCH["Fetch Agent"]
+    end
+
+    subgraph "Verbs Layer (ub-core)"
+        VERBS["Verbs API<br/>read / write / atomic / send"]
+        JETTY["Jetty<br/>JFS / JFR / JFC"]
+        MR["MR Table / MR Cache"]
+        ADDR["UbAddr (128-bit)"]
+        DEV["Device Trait<br/>Memory + NPU"]
+    end
+
+    subgraph "Transport Layer (ub-transport)"
+        SESSION["ReliableSession<br/>seq / ACK / SACK / RTO"]
+        DEDUP["DedupWindow"]
+        RCACHE["ReadResponseCache"]
+        FLOW["Credit Flow Control"]
+    end
+
+    subgraph "Fabric Layer (ub-fabric)"
+        UDP["UDP Fabric"]
+        TCP["TCP (reserved)"]
+        UDS["UDS (reserved)"]
+    end
+
+    subgraph "Control Plane (ub-control)"
+        HUB["Hub / Seed"]
+        HB["Heartbeat"]
+        MRPUB["MR_PUBLISH / MR_REVOKE"]
+        PEER["Peer Discovery"]
+    end
+
+    APP_KV --> VERBS
+    APP_CACHE --> GVA
+    GVA --> PLACER
+    GVA --> RTABLE
+    CACHE --> FETCH
+    FETCH --> RTABLE
+    FETCH --> CACHE
+    COH --> RTABLE
+    COH --> CACHE
+
+    GVA --> VERBS
+    PLACER --> MR
+    FETCH --> VERBS
+
+    VERBS --> JETTY
+    VERBS --> MR
+    VERBS --> ADDR
+    MR --> DEV
+    ADDR --> DEV
+
+    JETTY --> SESSION
+    VERBS --> SESSION
+    SESSION --> DEDUP
+    SESSION --> RCACHE
+    SESSION --> FLOW
+    SESSION --> UDP
+
+    HUB --> PEER
+    HB --> PEER
+    MRPUB --> PEER
+    PEER -.->|"MR broadcast"| MR
+    PEER -.->|"PeerChangeEvent"| SESSION
+
+    style APP_KV fill:#e1f5fe
+    style APP_CACHE fill:#e8f5e9
+    style GVA fill:#c8e6c9
+    style PLACER fill:#c8e6c9
+    style RTABLE fill:#c8e6c9
+    style COH fill:#c8e6c9
+    style CACHE fill:#c8e6c9
+    style FETCH fill:#c8e6c9
+    style VERBS fill:#fff9c4
+    style JETTY fill:#fff9c4
+    style MR fill:#fff9c4
+    style ADDR fill:#fff9c4
+    style DEV fill:#fff9c4
+    style SESSION fill:#ffe0b2
+    style DEDUP fill:#ffe0b2
+    style RCACHE fill:#ffe0b2
+    style FLOW fill:#ffe0b2
+    style UDP fill:#ffccbc
+    style TCP fill:#ffccbc
+    style UDS fill:#ffccbc
+    style HUB fill:#d1c4e9
+    style HB fill:#d1c4e9
+    style MRPUB fill:#d1c4e9
+    style PEER fill:#d1c4e9
 ```
 
 - **M1–M5 可独立交付演示**：verbs API（`ub_read/write/atomic/send` + NodeID 编址）不依赖 managed 层。
 - **Managed 层是叠加上层**：`ub_alloc` 内部调用 verbs 层接口，verbs 层不感知 managed 层存在。
 - **控制面横跨两层**：verbs 的 `MR_PUBLISH/HEARTBEAT` 与 managed 的 `ALLOC_REQ/INVALIDATE` 共用同一 `ub-control` 通道。
 - **控制/数据面隔离**：独立 tokio task + 独立 socket，控制 RPC 不阻塞数据路径。
+
+### 集群拓扑与双面分离
+
+```mermaid
+graph LR
+    subgraph "Node 0 (Hub)"
+        N0_CTRL["Control Plane<br/>port 7900"]
+        N0_DATA["Data Plane<br/>port 7910"]
+        N0_ADMIN["Admin + Metrics<br/>port 9090"]
+    end
+
+    subgraph "Node 1"
+        N1_CTRL["Control Plane<br/>port 7901"]
+        N1_DATA["Data Plane<br/>port 7911"]
+        N1_ADMIN["Admin + Metrics<br/>port 9091"]
+    end
+
+    subgraph "Node 2"
+        N2_CTRL["Control Plane<br/>port 7902"]
+        N2_DATA["Data Plane<br/>port 7912"]
+        N2_ADMIN["Admin + Metrics<br/>port 9092"]
+    end
+
+    N0_CTRL <-->|"HEARTBEAT, JOIN/LEAVE, MR_PUBLISH"| N1_CTRL
+    N0_CTRL <-->|"HEARTBEAT, JOIN/LEAVE, MR_PUBLISH"| N2_CTRL
+    N1_CTRL <-->|"HEARTBEAT, MR_PUBLISH"| N2_CTRL
+
+    N0_DATA <-->|"Data/Ack/Credit verbs frames"| N1_DATA
+    N0_DATA <-->|"Data/Ack/Credit verbs frames"| N2_DATA
+    N1_DATA <-->|"Data/Ack/Credit verbs frames"| N2_DATA
+
+    CLI["unibusctl"] -->|"HTTP"| N0_ADMIN
+
+    style N0_CTRL fill:#d1c4e9
+    style N1_CTRL fill:#d1c4e9
+    style N2_CTRL fill:#d1c4e9
+    style N0_DATA fill:#ffe0b2
+    style N1_DATA fill:#ffe0b2
+    style N2_DATA fill:#ffe0b2
+    style N0_ADMIN fill:#e1f5fe
+    style N1_ADMIN fill:#e1f5fe
+    style N2_ADMIN fill:#e1f5fe
+    style CLI fill:#f5f5f5
+```
+
+### Verbs 层远程写数据流
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant DP as DataPlaneEngine<br/>(Node A)
+    participant TX as TransportManager<br/>(Node A)
+    participant Fabric as UDP Fabric
+    participant RX as TransportManager<br/>(Node B)
+    participant Verb as Verb Handler<br/>(Node B)
+    participant MR as MR Table<br/>(Node B)
+
+    App->>DP: "ub_write_remote(addr, data)"
+    DP->>DP: "encode FrameHeader<br/>verb=Write, opaque=N"
+    DP->>TX: "send(node_b, frame)"
+    TX->>TX: "assign stream_seq<br/>credit check"
+    TX->>Fabric: "UDP send"
+    Fabric->>RX: "UDP recv"
+    RX->>RX: "DedupWindow check<br/>ACK frame"
+    RX->>Verb: "InboundFrame"
+    Verb->>MR: "resolve addr to MR + offset"
+    MR-->>Verb: "local memory slice"
+    Verb->>MR: "write data"
+    Verb-->>RX: "response frame (ok)"
+    RX->>Fabric: "UDP send (ACK + resp)"
+    Fabric->>TX: "UDP recv"
+    TX->>TX: "process ACK<br/>advance send window"
+    TX-->>DP: "completion (if awaited)"
+    DP-->>App: "Ok(())"
+```
+
+### Verbs 层远程读数据流
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant DP as DataPlaneEngine<br/>(Node A)
+    participant TX as TransportManager<br/>(Node A)
+    participant Fabric as UDP Fabric
+    participant RX as TransportManager<br/>(Node B)
+    participant Verb as Verb Handler<br/>(Node B)
+    participant MR as MR Table<br/>(Node B)
+
+    App->>DP: "ub_read_remote(addr, len)"
+    DP->>DP: "encode FrameHeader<br/>verb=Read, opaque=N"
+    DP->>DP: "register pending request<br/>opaque to oneshot channel"
+    DP->>TX: "send(node_b, frame)"
+    TX->>Fabric: "UDP send"
+    Fabric->>RX: "UDP recv"
+    RX->>RX: "DedupWindow check<br/>ACK frame"
+    RX->>Verb: "InboundFrame"
+    Verb->>MR: "resolve addr to MR + offset"
+    MR-->>Verb: "local memory slice"
+    Verb->>Verb: "read data"
+    Verb-->>RX: "response frame (data)"
+    RX->>Fabric: "UDP send (ACK + data resp)"
+    Fabric->>TX: "UDP recv"
+    TX->>TX: "process ACK<br/>match response to request"
+    TX->>DP: "deliver response via oneshot"
+    DP-->>App: "Ok(data)"
+```
+
+### Jetty 消息发送流程
+
+```mermaid
+sequenceDiagram
+    participant App as Application<br/>(Node A)
+    participant JFS as JFS<br/>(Node A)
+    participant DP as DataPlaneEngine<br/>(Node A)
+    participant Fabric as UDP Fabric
+    participant DP_B as DataPlaneEngine<br/>(Node B)
+    participant JFR as JFR<br/>(Node B)
+    participant JFC as JFC<br/>(Node B)
+
+    App->>JFR: "post_recv(buf)"
+    Note over JFR: "pre-post receive buffer"
+
+    App->>JFS: "ub_send(msg, target)"
+    JFS->>DP: "encode Send frame"
+    DP->>Fabric: "UDP send (Data frame)"
+    Fabric->>DP_B: "UDP recv"
+    DP_B->>JFR: "deliver message to<br/>pre-posted buffer"
+    JFR->>JFC: "enqueue CQE<br/>(recv completion)"
+    App->>JFC: "poll_cqe()"
+    JFC-->>App: "CQE: message received"
+```
+
+### Managed 层 SWMR 一致性生命周期
+
+```mermaid
+sequenceDiagram
+    participant App1 as Application<br/>(Node 1)
+    participant MA1 as Managed Layer<br/>(Node 1)
+    participant App2 as Application<br/>(Node 2)
+    participant MA2 as Managed Layer<br/>(Node 2)
+    participant Home as Home Node<br/>(Region Owner)
+
+    rect rgb(232, 245, 233)
+        Note over App1,Home: "Phase 1: Allocate + Write"
+        App1->>MA1: "ub_alloc(size)"
+        MA1->>MA1: "Placer select home node"
+        MA1-->>App1: "GVA + region_id"
+        App1->>MA1: "acquire_writer(GVA)"
+        MA1->>Home: "CoherenceSM: lock write"
+        Home-->>MA1: "granted, epoch=1"
+        App1->>MA1: "write_va(GVA, data)"
+        MA1->>Home: "write to local MR"
+        App1->>MA1: "release_writer(GVA)"
+        MA1->>Home: "CoherenceSM: unlock"
+        Home-->>MA1: "epoch=1 committed"
+    end
+
+    rect rgb(227, 242, 253)
+        Note over App2,Home: "Phase 2: Remote Read (Cache Miss then FETCH)"
+        App2->>MA2: "read_va(GVA)"
+        MA2->>MA2: "FetchAgent: cache miss"
+        MA2->>Home: "FETCH region data"
+        Home-->>MA2: "region data + epoch=1"
+        MA2->>MA2: "CachePool: insert<br/>state to Shared(1)"
+        MA2-->>App2: "data (source=fetch)"
+    end
+
+    rect rgb(255, 243, 224)
+        Note over App2,Home: "Phase 3: Cache Hit"
+        App2->>MA2: "read_va(GVA)"
+        MA2->>MA2: "FetchAgent: cache hit<br/>epoch match"
+        MA2-->>App2: "data (source=cache)"
+    end
+
+    rect rgb(252, 228, 236)
+        Note over App1,MA2: "Phase 4: Invalidation + Re-FETCH"
+        App1->>MA1: "acquire_writer(GVA)"
+        MA1->>Home: "CoherenceSM: lock write"
+        Home-->>MA1: "granted, epoch=2"
+        Home-->>MA2: "INVALIDATE(epoch=2)"
+        MA2->>MA2: "cache invalidated<br/>state to Invalid"
+        App1->>MA1: "write_va(GVA, new_data)"
+        App1->>MA1: "release_writer(GVA)"
+        Home-->>MA1: "epoch=2 committed"
+
+        App2->>MA2: "read_va(GVA)"
+        MA2->>MA2: "FetchAgent: cache miss<br/>(invalidated)"
+        MA2->>Home: "FETCH region data"
+        Home-->>MA2: "region data + epoch=2"
+        MA2->>MA2: "CachePool: insert<br/>state to Shared(2)"
+        MA2-->>App2: "new data (source=fetch)"
+    end
+```
+
+### 控制面集群形成流程
+
+```mermaid
+sequenceDiagram
+    participant N0 as Node 0<br/>(Hub)
+    participant N1 as Node 1
+    participant N2 as Node 2
+
+    Note over N0: "unibusd --config node0.yaml"
+    Note over N1: "unibusd --config node1.yaml"
+    Note over N2: "unibusd --config node2.yaml"
+
+    N1->>N0: "HELLO (join request)"
+    N0->>N0: "add to member table<br/>broadcast SNAPSHOT"
+    N0-->>N1: "SNAPSHOT (member list)"
+    N0-->>N2: "SNAPSHOT (member list)"
+
+    N2->>N0: "HELLO (join request)"
+    N0->>N0: "add to member table<br/>broadcast SNAPSHOT"
+    N0-->>N1: "SNAPSHOT (updated)"
+    N0-->>N2: "SNAPSHOT (updated)"
+
+    loop "Every heartbeat_interval_ms"
+        N0-->>N1: "HEARTBEAT"
+        N0-->>N2: "HEARTBEAT"
+        N1-->>N0: "HEARTBEAT"
+        N1-->>N2: "HEARTBEAT"
+        N2-->>N0: "HEARTBEAT"
+        N2-->>N1: "HEARTBEAT"
+    end
+
+    Note over N0,N2: "MR_PUBLISH on local MR register"
+    N1->>N0: "MR_PUBLISH (handle, addr, len)"
+    N0-->>N2: "MR_PUBLISH (broadcast)"
+    N2->>N2: "update MR cache table"
+```
+
+### 可靠传输与丢包恢复流程
+
+```mermaid
+sequenceDiagram
+    participant Sender as Sender<br/>(ReliableSession)
+    participant Fabric as UDP Fabric
+    participant Recv as Receiver<br/>(ReliableSession)
+
+    Note over Sender: "seq=1,2,3 in send window"
+
+    Sender->>Fabric: "Data(seq=1)"
+    Sender->>Fabric: "Data(seq=2)"
+    Sender->>Fabric: "Data(seq=3)"
+
+    Fabric->>Recv: "Data(seq=1) OK"
+    Fabric--xFabric: "Data(seq=2) LOST"
+    Fabric->>Recv: "Data(seq=3) OK"
+
+    Recv->>Recv: "DedupWindow: accept seq=1<br/>gap at seq=2<br/>accept seq=3 (buffered)"
+    Recv->>Fabric: "ACK(seq=1, SACK=[3])"
+
+    Fabric->>Sender: "ACK(seq=1, SACK=[3])"
+    Sender->>Sender: "seq=1 acknowledged<br/>seq=2 missing from ACK<br/>SACK indicates seq=3 received"
+
+    Note over Sender: "RTO expires for seq=2"
+    Sender->>Fabric: "Data(seq=2) RETRANSMIT"
+    Fabric->>Recv: "Data(seq=2) OK"
+    Recv->>Recv: "gap filled: deliver<br/>seq=2, seq=3"
+    Recv->>Fabric: "ACK(seq=3)"
+
+    Fabric->>Sender: "ACK(seq=3)"
+    Sender->>Sender: "advance send window<br/>return credit"
+```
 
 ---
 
