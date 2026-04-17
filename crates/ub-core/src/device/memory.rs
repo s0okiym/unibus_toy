@@ -4,7 +4,7 @@ use parking_lot::RwLock;
 
 use crate::device::Device;
 use crate::error::UbError;
-use crate::types::DeviceKind;
+use crate::types::{DeviceKind, StorageTier};
 
 /// CPU memory device — backing is a heap-allocated byte array.
 /// device_id is always 0 (FR-DEV-4).
@@ -50,6 +50,10 @@ impl Device for MemoryDevice {
 
     fn capacity(&self) -> u64 {
         self.capacity
+    }
+
+    fn tier(&self) -> StorageTier {
+        StorageTier::Warm
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), UbError> {
@@ -177,5 +181,11 @@ mod tests {
         assert_eq!(dev.kind(), DeviceKind::Memory);
         assert_eq!(dev.device_id(), 0);
         assert_eq!(dev.capacity(), 1024);
+    }
+
+    #[test]
+    fn test_memory_device_tier_is_warm() {
+        let dev = MemoryDevice::new(1024);
+        assert_eq!(dev.tier(), StorageTier::Warm);
     }
 }

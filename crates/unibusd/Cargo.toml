@@ -15,6 +15,7 @@ ub-control = { workspace = true }
 ub-fabric = { workspace = true }
 ub-obs = { workspace = true }
 ub-dataplane = { workspace = true }
+ub-managed = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

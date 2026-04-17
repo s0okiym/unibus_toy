@@ -1,0 +1,50 @@
+pod_id: 1
+node_id: 2
+control:
+  listen: "0.0.0.0:7921"
+  bootstrap: static
+  peers:
+    - "127.0.0.1:7920"
+    - "127.0.0.1:7922"
+  hub_node_id: 0
+data:
+  listen: "0.0.0.0:7931"
+  fabric: udp
+  mtu: 1400
+mr:
+  deregister_timeout_ms: 500
+device:
+  npu:
+    enabled: true
+    mem_size_mib: 64
+transport:
+  rto_ms: 200
+  max_retries: 8
+flow:
+  initial_credits: 64
+jetty:
+  jfs_depth: 1024
+  jfr_depth: 1024
+  jfc_depth: 1024
+  jfc_high_watermark: 896
+obs:
+  metrics_listen: "127.0.0.1:9191"
+heartbeat:
+  interval_ms: 1000
+  fail_after: 3
+managed:
+  enabled: true
+  placer_node_id: 1
+  pool:
+    memory_reserve_ratio: 0.25
+    npu_reserve_ratio: 0.50
+  writer_lease_ms: 5000
+  fetch_block_on_writer: true
+  cache:
+    max_bytes: 8388608
+    eviction: lru
+  cost_weights:
+    latency: 1.0
+    capacity: 0.3
+    tier_match: 0.5
+    load: 0.2

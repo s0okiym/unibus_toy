@@ -111,6 +111,88 @@ enum Commands {
         #[arg(long)]
         replica_jetty_id: Option<u32>,
     },
+    /// List all registered device profiles (Managed layer)
+    DeviceList,
+    /// Allocate a region in the managed layer (ub_alloc)
+    RegionAlloc {
+        /// Size in bytes to allocate
+        #[arg(short, long)]
+        size: u64,
+        /// Latency class: "critical", "normal", "bulk"
+        #[arg(long, default_value = "normal")]
+        latency_class: String,
+        /// Capacity class: "small", "large", "huge"
+        #[arg(long, default_value = "small")]
+        capacity_class: String,
+        /// Pin to device kind: "memory" or "npu"
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Free a region in the managed layer (ub_free)
+    RegionFree {
+        /// Region ID to free
+        region_id: u64,
+    },
+    /// List all regions in the managed layer
+    RegionList,
+    /// Read from a virtual address (ub_read_va)
+    VaRead {
+        /// Virtual address (hex u128)
+        va: String,
+        /// Number of bytes to read
+        #[arg(short, long, default_value = "64")]
+        len: u32,
+        /// Offset within the region
+        #[arg(long, default_value = "0")]
+        offset: u64,
+    },
+    /// Write to a virtual address (ub_write_va)
+    VaWrite {
+        /// Virtual address (hex u128)
+        va: String,
+        /// Data string to write
+        data: String,
+        /// Offset within the region
+        #[arg(long, default_value = "0")]
+        offset: u64,
+    },
+    /// Acquire writer lock for a region (SWMR)
+    AcquireWriter {
+        /// Virtual address (hex u128)
+        va: String,
+    },
+    /// Release writer lock for a region (SWMR)
+    ReleaseWriter {
+        /// Virtual address (hex u128)
+        va: String,
+    },
+    /// Register a remote region in the local region table (for cross-node discovery)
+    RegionRegisterRemote {
+        /// Region ID
+        region_id: u64,
+        /// Home node ID
+        home_node_id: u16,
+        /// Device ID on the home node
+        device_id: u16,
+        /// MR handle on the home node
+        mr_handle: u32,
+        /// Base offset within the home MR
+        #[arg(long, default_value = "0")]
+        base_offset: u64,
+        /// Region length in bytes
+        len: u64,
+        /// Current epoch
+        #[arg(long, default_value = "0")]
+        epoch: u64,
+    },
+    /// Invalidate a cached region on this node (simulates INVALIDATE from home node)
+    RegionInvalidate {
+        /// Region ID to invalidate
+        region_id: u64,
+        /// New epoch from the writer
+        #[arg(long, default_value = "0")]
+        new_epoch: u64,
+    },
 }
 
 #[tokio::main]
@@ -438,6 +520,215 @@ async fn main() -> anyhow::Result<()> {
                 println!("Error: {err}");
             } else {
                 println!("{body}");
+            }
+        }
+        Commands::DeviceList => {
+            let url = format!("{}/admin/device/list", cli.addr);
+            let resp = client.get(&url).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+
+            if let Some(devices) = body.get("devices").and_then(|n| n.as_array()) {
+                if devices.is_empty() {
+                    println!("No devices registered.");
+                } else {
+                    println!("{:<8} {:<10} {:<8} {:<6} {:<14} {:<10} {:<10} {:<10} {:<16} {:<16} {:<14} {:<14} {:<10}",
+                        "NodeID", "DevID", "Kind", "Tier", "Capacity", "Used", "Free", "FreeRatio", "ReadBW(Mbps)", "WriteBW(Mbps)", "ReadLat(ns)", "WriteLat(ns)", "RPS");
+                    for d in devices {
+                        let node_id = d.get("node_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let dev_id = d.get("device_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let kind = d.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+                        let tier = d.get("tier").and_then(|v| v.as_str()).unwrap_or("?");
+                        let cap = d.get("capacity_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let used = d.get("used_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let free = d.get("free_bytes").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let free_ratio = d.get("free_ratio").and_then(|v| v.as_str()).unwrap_or("?");
+                        let r_bw = d.get("peak_read_bw_mbps").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let w_bw = d.get("peak_write_bw_mbps").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let r_lat = d.get("read_latency_ns_p50").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let w_lat = d.get("write_latency_ns_p50").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let rps = d.get("recent_rps").and_then(|v| v.as_u64()).unwrap_or(0);
+                        println!("{:<8} {:<10} {:<8} {:<6} {:<14} {:<10} {:<10} {:<10} {:<16} {:<16} {:<14} {:<14} {:<10}",
+                            node_id, dev_id, kind, tier, cap, used, free, free_ratio, r_bw, w_bw, r_lat, w_lat, rps);
+                    }
+                }
+            } else {
+                println!("Unexpected response: {body}");
+            }
+        }
+        Commands::RegionAlloc { size, latency_class, capacity_class, pin } => {
+            let url = format!("{}/admin/region/alloc", cli.addr);
+            let mut body = serde_json::json!({
+                "size": size,
+                "latency_class": latency_class,
+                "capacity_class": capacity_class,
+            });
+            if let Some(ref p) = pin {
+                body["pin"] = serde_json::json!(p);
+            }
+            let resp = client.post(&url).json(&body).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").is_some() {
+                let va = body.get("va").and_then(|v| v.as_str()).unwrap_or("?");
+                let region_id = body.get("region_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let home = body.get("home_node_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let len = body.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("Region allocated: region_id={region_id} va=0x{va} home_node={home} len={len}");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::RegionFree { region_id } => {
+            let url = format!("{}/admin/region/free", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"region_id": region_id}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").is_some() {
+                println!("Region {region_id} freed");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::RegionList => {
+            let url = format!("{}/admin/region/list", cli.addr);
+            let resp = client.get(&url).send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if let Some(regions) = body.get("regions").and_then(|n| n.as_array()) {
+                if regions.is_empty() {
+                    println!("No regions allocated.");
+                } else {
+                    println!("{:<12} {:<12} {:<10} {:<10} {:<12} {:<10} {:<8} {:<10} {:<14} {:<8} {:<12}",
+                        "RegionID", "HomeNode", "DeviceID", "MRHandle", "BaseOffset", "Len", "Epoch", "State", "LocalMR", "Writer", "Readers");
+                    for r in regions {
+                        let rid = r.get("region_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let home = r.get("home_node_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let dev = r.get("device_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let mr = r.get("mr_handle").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let base = r.get("base_offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let len = r.get("len").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let epoch = r.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let state = r.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+                        let local_mr = r.get("local_mr_handle").and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or("-".to_string());
+                        let writer = r.get("writer_node_id").and_then(|v| v.as_u64()).map(|v| v.to_string()).unwrap_or("-".to_string());
+                        let readers = r.get("readers").and_then(|v| v.as_array()).map(|arr| {
+                            arr.iter().filter_map(|v| v.as_u64().map(|n| n.to_string())).collect::<Vec<_>>().join(",")
+                        }).unwrap_or_else(|| "-".to_string());
+                        println!("{:<12} {:<12} {:<10} {:<10} {:<12} {:<10} {:<8} {:<10} {:<14} {:<8} {:<12}",
+                            rid, home, dev, mr, base, len, epoch, state, local_mr, writer, readers);
+                    }
+                }
+            } else {
+                println!("Unexpected response: {body}");
+            }
+        }
+        Commands::VaRead { va, len, offset } => {
+            let url = format!("{}/admin/verb/read-va", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"va": va, "offset": offset, "len": len}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("data").is_some() {
+                let data = body.get("data").and_then(|v| v.as_array()).unwrap();
+                let bytes: Vec<u8> = data.iter().filter_map(|v| v.as_u64().map(|b| b as u8)).collect();
+                let data_len = body.get("len").and_then(|v| v.as_u64()).unwrap_or(bytes.len() as u64);
+                let text = String::from_utf8_lossy(&bytes);
+                println!("Read {} bytes from va={va} offset={offset}: {:?}", data_len, text);
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::VaWrite { va, data, offset } => {
+            let url = format!("{}/admin/verb/write-va", cli.addr);
+            let data_bytes = data.as_bytes().to_vec();
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"va": va, "offset": offset, "data": data_bytes}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").is_some() {
+                println!("Write {} bytes to va={va} offset={offset}", data.len());
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::AcquireWriter { va } => {
+            let url = format!("{}/admin/verb/acquire-writer", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"va": va}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+            if status == "granted" {
+                let region_id = body.get("region_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let epoch = body.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("Writer lock acquired: va={va} region_id={region_id} epoch={epoch}");
+            } else if status == "denied" {
+                let reason = body.get("reason").and_then(|v| v.as_str()).unwrap_or("unknown");
+                println!("Writer lock denied: {reason}");
+            } else if status == "queued" {
+                println!("Writer lock queued (waiting for current writer to release)");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::ReleaseWriter { va } => {
+            let url = format!("{}/admin/verb/release-writer", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"va": va}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").is_some() {
+                let region_id = body.get("region_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let epoch = body.get("epoch").and_then(|v| v.as_u64()).unwrap_or(0);
+                println!("Writer lock released: region_id={region_id} epoch={epoch}");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::RegionRegisterRemote { region_id, home_node_id, device_id, mr_handle, base_offset, len, epoch } => {
+            let url = format!("{}/admin/region/register-remote", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({
+                    "region_id": region_id,
+                    "home_node_id": home_node_id,
+                    "device_id": device_id,
+                    "mr_handle": mr_handle,
+                    "base_offset": base_offset,
+                    "len": len,
+                    "epoch": epoch,
+                }))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            if body.get("status").is_some() {
+                println!("Remote region registered: region_id={region_id} home_node={home_node_id}");
+            } else if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Error: {err}");
+            } else {
+                println!("{body}");
+            }
+        }
+        Commands::RegionInvalidate { region_id, new_epoch } => {
+            let url = format!("{}/admin/region/invalidate", cli.addr);
+            let resp = client.post(&url)
+                .json(&serde_json::json!({"region_id": region_id, "new_epoch": new_epoch}))
+                .send().await?;
+            let body: serde_json::Value = resp.json().await?;
+            let invalidated = body.get("invalidated").and_then(|v| v.as_bool()).unwrap_or(false);
+            if invalidated {
+                println!("Region {region_id} invalidated (new_epoch={new_epoch})");
+            } else {
+                println!("Region {region_id} not invalidated (not cached or stale)");
             }
         }
     }

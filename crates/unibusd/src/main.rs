@@ -13,9 +13,10 @@ use ub_core::config::NodeConfig;
 use ub_core::device::memory::MemoryDevice;
 use ub_core::device::Device;
 use ub_core::mr::{MrCacheTable, MrTable};
-use ub_core::types::{JettyAddr, MrPerms, PeerChangeEvent};
+use ub_core::types::{AccessPattern, AllocHints, CapacityClass, DeviceProfile, JettyAddr, LatencyClass, MrPerms, PeerChangeEvent, RegionId, RegionInfo, RegionState, UbVa};
 use ub_dataplane::DataPlaneEngine;
 use ub_fabric::udp::UdpFabric;
+use ub_managed::{CachePool, CoherenceManager, DeviceRegistry, FetchAgent, Placer, RegionTable, SubAllocator};
 use ub_obs::metrics;
 use ub_transport::manager::TransportManager;
 
@@ -35,6 +36,13 @@ struct AppState {
     mr_cache: Arc<MrCacheTable>,
     jetty_table: Arc<ub_core::jetty::JettyTable>,
     dataplane: Arc<tokio::sync::Mutex<DataPlaneEngine>>,
+    device_registry: Arc<DeviceRegistry>,
+    placer: Arc<Placer>,
+    region_table: Arc<RegionTable>,
+    fetch_agent: Arc<FetchAgent>,
+    coherence: Arc<CoherenceManager>,
+    /// MR handle for the local memory pool MR (used for managed layer regions).
+    pool_mr_handle: Option<u32>,
     prom_handle: metrics_exporter_prometheus::PrometheusHandle,
 }
 
@@ -101,6 +109,93 @@ struct VerbWriteImmRequest {
     imm: u64,
     dst_node_id: u16,
     dst_jetty_id: u32,
+}
+
+// ── Managed Layer request types ─────────────────────────────
+
+#[derive(Deserialize)]
+struct RegionAllocRequest {
+    /// Size in bytes to allocate
+    size: u64,
+    /// Latency class: "critical", "normal", "bulk" (default: "normal")
+    #[serde(default = "default_latency_class")]
+    latency_class: String,
+    /// Capacity class: "small", "large", "huge" (default: "small")
+    #[serde(default = "default_capacity_class")]
+    capacity_class: String,
+    /// Pin to device kind: "memory", "npu", or empty (default: none)
+    #[serde(default)]
+    pin: Option<String>,
+}
+
+fn default_latency_class() -> String { "normal".to_string() }
+fn default_capacity_class() -> String { "small".to_string() }
+
+#[derive(Deserialize)]
+struct RegionFreeRequest {
+    /// Region ID to free
+    region_id: u64,
+}
+
+#[derive(Deserialize)]
+struct VerbReadVaRequest {
+    /// Virtual address (hex u128)
+    va: String,
+    /// Offset within the region
+    #[serde(default)]
+    offset: u64,
+    /// Number of bytes to read
+    len: u32,
+}
+
+#[derive(Deserialize)]
+struct VerbWriteVaRequest {
+    /// Virtual address (hex u128)
+    va: String,
+    /// Offset within the region
+    #[serde(default)]
+    offset: u64,
+    /// Data to write
+    data: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct AcquireWriterRequest {
+    /// Virtual address (hex u128)
+    va: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseWriterRequest {
+    /// Virtual address (hex u128)
+    va: String,
+}
+
+#[derive(Deserialize)]
+struct RegionInvalidateRequest {
+    /// Region ID to invalidate
+    region_id: u64,
+    /// New epoch from the writer
+    new_epoch: u64,
+}
+
+#[derive(Deserialize)]
+struct RegionRegisterRemoteRequest {
+    /// Region ID
+    region_id: u64,
+    /// Home node ID
+    home_node_id: u16,
+    /// Device ID on the home node
+    device_id: u16,
+    /// MR handle on the home node
+    mr_handle: u32,
+    /// Base offset within the home MR
+    base_offset: u64,
+    /// Region length in bytes
+    len: u64,
+    /// Current epoch
+    #[serde(default)]
+    epoch: u64,
 }
 
 // ── KV Demo request types ─────────────────────────────────────
@@ -231,6 +326,100 @@ async fn main() {
 
     let dataplane = Arc::new(tokio::sync::Mutex::new(dataplane));
 
+    // Initialize device registry (Managed layer) and register local device profiles
+    let device_registry = Arc::new(DeviceRegistry::new(config.managed.clone()));
+    let mut next_device_id: u16 = 0;
+    {
+        // Register local devices from MR table
+        let mr_entries = mr_table.list();
+        for mr in &mr_entries {
+            let profile = DeviceProfile {
+                device_key: (config.node_id, next_device_id),
+                kind: mr.device.kind(),
+                tier: mr.device.tier(),
+                capacity_bytes: mr.len,
+                peak_read_bw_mbps: mr.device.peak_read_bw_mbps(),
+                peak_write_bw_mbps: mr.device.peak_write_bw_mbps(),
+                read_latency_ns_p50: mr.device.read_latency_ns_p50(),
+                write_latency_ns_p50: mr.device.write_latency_ns_p50(),
+                used_bytes: 0,
+                recent_rps: 0,
+            };
+            device_registry.register(profile);
+            next_device_id += 1;
+        }
+    }
+
+    // Initialize Placer and RegionTable (Managed layer)
+    let placer = Arc::new(Placer::new(Arc::clone(&device_registry), config.managed.clone()));
+    let region_table = Arc::new(RegionTable::new());
+
+    // If managed is enabled, register pool MRs and set up sub-allocators
+    let mut pool_mr_handle: Option<u32> = None;
+    if config.managed.enabled {
+        let pool_config = &config.managed.pool;
+
+        // Register a memory pool MR
+        let memory_pool_size = 1024 * 1024 * 256; // 256 MiB default pool
+        let memory_dev: Arc<dyn Device> = Arc::new(MemoryDevice::new(memory_pool_size as usize));
+        let memory_pool_reserve = (memory_pool_size as f64 * pool_config.memory_reserve_ratio) as u64;
+        let memory_pool_usable = memory_pool_size - memory_pool_reserve;
+
+        if let Ok((_addr, handle)) = mr_table.register(memory_dev, memory_pool_size, MrPerms::READ | MrPerms::WRITE | MrPerms::ATOMIC) {
+            pool_mr_handle = Some(handle.0);
+            let pool_device_id = next_device_id;
+            #[allow(unused_assignments)]
+            { next_device_id += 1; }
+
+            let sub_alloc = SubAllocator::new(0, memory_pool_usable);
+            placer.register_sub_allocator(config.node_id, pool_device_id, sub_alloc);
+
+            // Register a device profile for the pool device
+            let pool_profile = DeviceProfile {
+                device_key: (config.node_id, pool_device_id),
+                kind: ub_core::types::DeviceKind::Memory,
+                tier: ub_core::types::StorageTier::Warm,
+                capacity_bytes: memory_pool_usable,
+                peak_read_bw_mbps: 10_000,
+                peak_write_bw_mbps: 10_000,
+                read_latency_ns_p50: 200,
+                write_latency_ns_p50: 200,
+                used_bytes: 0,
+                recent_rps: 0,
+            };
+            device_registry.register(pool_profile);
+        }
+
+        tracing::info!("managed layer enabled: pool MRs registered");
+    }
+
+    // Initialize FetchAgent with cache pool (with eviction notification to RegionTable)
+    let cache_pool = Arc::new(CachePool::with_region_table(
+        SubAllocator::new(0, config.managed.cache.max_bytes),
+        config.managed.cache.max_bytes,
+        Arc::clone(&region_table),
+    ));
+    let fetch_agent = Arc::new(FetchAgent::new(Arc::clone(&region_table), Arc::clone(&cache_pool)));
+
+    // Initialize CoherenceManager (SWMR protocol)
+    let coherence = Arc::new(CoherenceManager::new(config.managed.writer_lease_ms));
+
+    // Spawn writer lease expiry checker
+    let coherence_timer = Arc::clone(&coherence);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        loop {
+            interval.tick().await;
+            let expired = coherence_timer.check_lease_expiry();
+            for (region_id, writer_node_id) in expired {
+                tracing::info!(
+                    "writer lease expired: region_id={}, writer_node_id={}",
+                    region_id.0, writer_node_id
+                );
+            }
+        }
+    });
+
     // Spawn a task to connect data plane to peers as they join
     let peer_change_rx = control.peer_change_rx.clone();
     let members_dp = Arc::clone(&members);
@@ -290,7 +479,13 @@ async fn main() {
         mr_table: Arc::clone(&mr_table),
         mr_cache: Arc::clone(&mr_cache),
         jetty_table: Arc::clone(&jetty_table),
-        dataplane,
+        dataplane: Arc::clone(&dataplane),
+        device_registry: Arc::clone(&device_registry),
+        placer: Arc::clone(&placer),
+        region_table: Arc::clone(&region_table),
+        fetch_agent: Arc::clone(&fetch_agent),
+        coherence: Arc::clone(&coherence),
+        pool_mr_handle,
         prom_handle,
     });
 
@@ -316,6 +511,16 @@ async fn main() {
         .route("/admin/kv/put", post(kv_put))
         .route("/admin/kv/get", post(kv_get))
         .route("/admin/kv/cas", post(kv_cas))
+        .route("/admin/device/list", get(device_list))
+        .route("/admin/region/alloc", post(region_alloc))
+        .route("/admin/region/free", post(region_free))
+        .route("/admin/region/list", get(region_list))
+        .route("/admin/region/register-remote", post(region_register_remote))
+        .route("/admin/region/invalidate", post(region_invalidate))
+        .route("/admin/verb/read-va", post(verb_read_va))
+        .route("/admin/verb/write-va", post(verb_write_va))
+        .route("/admin/verb/acquire-writer", post(acquire_writer))
+        .route("/admin/verb/release-writer", post(release_writer))
         .route("/metrics", get(metrics_endpoint))
         .with_state(state);
 
@@ -909,6 +1114,442 @@ async fn kv_cas(
     }
 }
 
+async fn device_list(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let profiles = state.device_registry.list();
+    let list: Vec<Value> = profiles.iter().map(|p| {
+        json!({
+            "node_id": p.device_key.0,
+            "device_id": p.device_key.1,
+            "kind": format!("{:?}", p.kind),
+            "tier": format!("{:?}", p.tier),
+            "capacity_bytes": p.capacity_bytes,
+            "used_bytes": p.used_bytes,
+            "free_bytes": p.free_bytes(),
+            "free_ratio": format!("{:.2}", p.free_ratio()),
+            "peak_read_bw_mbps": p.peak_read_bw_mbps,
+            "peak_write_bw_mbps": p.peak_write_bw_mbps,
+            "read_latency_ns_p50": p.read_latency_ns_p50,
+            "write_latency_ns_p50": p.write_latency_ns_p50,
+            "recent_rps": p.recent_rps,
+        })
+    }).collect();
+    Json(json!({ "devices": list }))
+}
+
+// ── Managed Layer handlers ─────────────────────────────────────
+
+async fn region_alloc(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegionAllocRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let latency_class = match req.latency_class.as_str() {
+        "critical" => LatencyClass::Critical,
+        "bulk" => LatencyClass::Bulk,
+        _ => LatencyClass::Normal,
+    };
+    let capacity_class = match req.capacity_class.as_str() {
+        "large" => CapacityClass::Large,
+        "huge" => CapacityClass::Huge,
+        _ => CapacityClass::Small,
+    };
+    let pin = match req.pin.as_deref() {
+        Some("memory") => Some(ub_core::types::DeviceKind::Memory),
+        Some("npu") => Some(ub_core::types::DeviceKind::Npu),
+        _ => None,
+    };
+
+    let hints = AllocHints {
+        size: req.size,
+        access: AccessPattern::Mixed,
+        latency_class,
+        capacity_class,
+        pin,
+        expected_readers: 0,
+    };
+
+    match state.placer.place(&hints, state.config.node_id) {
+        Ok((va, placement)) => {
+            // Determine the MR handle: use the pool MR handle if this is a local home region
+            let mr_handle = if placement.home_node_id == state.config.node_id {
+                state.pool_mr_handle.unwrap_or(placement.mr_handle)
+            } else {
+                placement.mr_handle
+            };
+            // Update the placement's mr_handle
+            state.placer.set_mr_handle(va.region_id(), mr_handle);
+
+            // Record in the region table as Home
+            let region_info = RegionInfo {
+                region_id: va.region_id(),
+                home_node_id: placement.home_node_id,
+                device_id: placement.device_id,
+                mr_handle,
+                base_offset: placement.base_offset,
+                len: placement.len,
+                epoch: 0,
+                state: RegionState::Home,
+                local_mr_handle: None,
+            };
+            state.region_table.insert(region_info);
+
+            // Register with CoherenceManager for SWMR tracking
+            state.coherence.register_region(
+                va.region_id(),
+                placement.mr_handle,
+                placement.base_offset,
+                placement.len,
+            );
+
+            ub_obs::incr(ub_obs::PLACEMENT_DECISION);
+
+            // Record tier label for placement decision
+            ub_obs::incr_label(ub_obs::PLACEMENT_DECISION, "tier", "warm");
+
+            Json(json!({
+                "status": "ok",
+                "va": format!("{:032x}", va.0),
+                "region_id": va.region_id().0,
+                "home_node_id": placement.home_node_id,
+                "device_id": placement.device_id,
+                "mr_handle": placement.mr_handle,
+                "base_offset": placement.base_offset,
+                "len": placement.len,
+            }))
+        }
+        Err(e) => Json(json!({"error": e})),
+    }
+}
+
+async fn region_free(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegionFreeRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let region_id = RegionId(req.region_id);
+    match state.placer.free(region_id) {
+        Some(_placement) => {
+            state.region_table.remove(region_id);
+            state.coherence.unregister_region(region_id);
+            Json(json!({"status": "ok"}))
+        }
+        None => Json(json!({"error": "region not found"})),
+    }
+}
+
+/// Register a remote region in the local region table.
+/// This simulates what the control plane would do in a real distributed system:
+/// when a region is created, the placer notifies other nodes so they can
+/// discover the region for future reads.
+async fn region_register_remote(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegionRegisterRemoteRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let region_info = RegionInfo {
+        region_id: RegionId(req.region_id),
+        home_node_id: req.home_node_id,
+        device_id: req.device_id,
+        mr_handle: req.mr_handle,
+        base_offset: req.base_offset,
+        len: req.len,
+        epoch: req.epoch,
+        state: RegionState::Invalid, // Not yet cached — will become Shared on first FETCH
+        local_mr_handle: None,
+    };
+    state.region_table.insert(region_info);
+
+    Json(json!({
+        "status": "ok",
+        "region_id": req.region_id,
+        "state": "Invalid",
+    }))
+}
+
+/// Handle an INVALIDATE notification from the home node.
+/// Invalidates the local cache entry for the given region.
+async fn region_invalidate(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RegionInvalidateRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let region_id = RegionId(req.region_id);
+    let invalidated = state.fetch_agent.receive_invalidate(region_id, req.new_epoch);
+    if invalidated {
+        Json(json!({"status": "ok", "region_id": req.region_id, "new_epoch": req.new_epoch, "invalidated": true}))
+    } else {
+        Json(json!({"status": "ok", "region_id": req.region_id, "new_epoch": req.new_epoch, "invalidated": false, "reason": "not cached or stale"}))
+    }
+}
+
+async fn region_list(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let regions = state.region_table.list();
+    let list: Vec<Value> = regions.iter().map(|r| {
+        // Add coherence info (writer, readers) if this is a home region
+        let (writer, readers) = if r.state == RegionState::Home && state.coherence.contains_region(r.region_id) {
+            let w = state.coherence.get_writer(r.region_id).map(|info| info.writer_node_id);
+            let rs: Vec<u16> = state.coherence.get_readers(r.region_id).into_iter().collect();
+            (w, rs)
+        } else {
+            (None, Vec::new())
+        };
+        json!({
+            "region_id": r.region_id.0,
+            "home_node_id": r.home_node_id,
+            "device_id": r.device_id,
+            "mr_handle": r.mr_handle,
+            "base_offset": r.base_offset,
+            "len": r.len,
+            "epoch": r.epoch,
+            "state": format!("{:?}", r.state),
+            "local_mr_handle": r.local_mr_handle,
+            "writer_node_id": writer,
+            "readers": readers,
+        })
+    }).collect();
+    Json(json!({ "regions": list }))
+}
+
+async fn verb_read_va(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerbReadVaRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let va = match parse_va(&req.va) {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let region_id = va.region_id();
+    let offset_in_region = va.offset() + req.offset;
+
+    // Use FetchAgent for read-through cache logic
+    match state.fetch_agent.read_va(region_id) {
+        ub_managed::fetch_agent::ReadVaResult::Home(region) => {
+            // Read directly from local MR
+            let offset = region.base_offset + offset_in_region;
+            if let Some(entry) = state.mr_table.lookup(region.mr_handle) {
+                let mut buf = vec![0u8; req.len as usize];
+                match entry.device.read(offset, &mut buf) {
+                    Ok(()) => Json(json!({"data": buf, "len": buf.len(), "source": "home"})),
+                    Err(e) => Json(json!({"error": format!("{}", e)})),
+                }
+            } else {
+                Json(json!({"error": "home MR not found"}))
+            }
+        }
+        ub_managed::fetch_agent::ReadVaResult::CacheHit(_pool_offset, _region) => {
+            // Read from cache pool MR — use the pool MR handle
+            let cache_entry = state.fetch_agent.cache_pool().lookup(region_id).unwrap();
+            let read_offset = cache_entry.pool_offset + offset_in_region;
+            if read_offset + req.len as u64 > cache_entry.pool_offset + cache_entry.len {
+                return Json(json!({"error": "read beyond cached region bounds"}));
+            }
+            // Use the pool MR handle to find the right MR
+            let pool_handle = state.pool_mr_handle.unwrap_or(0);
+            if let Some(entry) = state.mr_table.lookup(pool_handle) {
+                let mut buf = vec![0u8; req.len as usize];
+                match entry.device.read(read_offset, &mut buf) {
+                    Ok(()) => Json(json!({"data": buf, "len": buf.len(), "source": "cache"})),
+                    Err(e) => Json(json!({"error": format!("{}", e)})),
+                }
+            } else {
+                Json(json!({"error": "pool MR not found"}))
+            }
+        }
+        ub_managed::fetch_agent::ReadVaResult::CacheMiss(region) => {
+            // FETCH the full region from home node via data plane, then cache and read
+            let ub_addr = UbAddr::new(
+                state.config.pod_id,
+                region.home_node_id,
+                region.device_id,
+                region.base_offset,
+                0,
+            );
+            let dp = state.dataplane.lock().await;
+            match dp.ub_read_remote(ub_addr, region.len as u32).await {
+                Ok(full_data) => {
+                    drop(dp);
+                    // Cache the full region data.
+                    // Use the region table's current epoch (not +1) — the epoch is
+                    // authoritative and the home node's acquire_writer/release_writer
+                    // cycle handles epoch bumping.
+                    if let Ok(pool_offset) = state.fetch_agent.complete_fetch(
+                        region_id,
+                        region.len,
+                        region.epoch,
+                    ) {
+                        // Write the fetched data into the pool MR at the allocated offset
+                        if let Some(pool_handle) = state.pool_mr_handle {
+                            if let Some(entry) = state.mr_table.lookup(pool_handle) {
+                                let _ = entry.device.write(pool_offset, &full_data);
+                            }
+                        }
+                    }
+                    // Extract the requested portion from the full data
+                    let start = offset_in_region as usize;
+                    let end = (start + req.len as usize).min(full_data.len());
+                    let data = if start < full_data.len() {
+                        full_data[start..end].to_vec()
+                    } else {
+                        vec![0u8; req.len as usize]
+                    };
+                    Json(json!({"data": data, "len": data.len(), "source": "fetch"}))
+                }
+                Err(e) => Json(json!({"error": format!("{}", e)})),
+            }
+        }
+        ub_managed::fetch_agent::ReadVaResult::UnknownRegion => {
+            Json(json!({"error": "region not found"}))
+        }
+    }
+}
+
+async fn verb_write_va(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<VerbWriteVaRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let va = match parse_va(&req.va) {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let region_id = va.region_id();
+    let region = match state.region_table.lookup(region_id) {
+        Some(r) => r,
+        None => return Json(json!({"error": "region not found"})),
+    };
+
+    let offset = region.base_offset + va.offset() + req.offset;
+
+    match region.state {
+        RegionState::Home => {
+            // Write to local MR
+            if let Some(entry) = state.mr_table.lookup(region.mr_handle) {
+                match entry.device.write(offset, &req.data) {
+                    Ok(()) => Json(json!({"status": "ok"})),
+                    Err(e) => Json(json!({"error": format!("{}", e)})),
+                }
+            } else {
+                Json(json!({"error": "home MR not found"}))
+            }
+        }
+        RegionState::Shared(_) | RegionState::Invalid => {
+            // Write remotely to home node
+            write_va_remote(&state, &region, offset, &req.data).await
+        }
+    }
+}
+
+async fn acquire_writer(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AcquireWriterRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let va = match parse_va(&req.va) {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let region_id = va.region_id();
+
+    // Try to acquire writer via CoherenceManager
+    let result = state.coherence.acquire_writer(region_id, state.config.node_id);
+    match result {
+        ub_managed::AcquireWriterResult::Granted { epoch, .. } => {
+            Json(json!({
+                "status": "granted",
+                "va": format!("{:032x}", va.0),
+                "region_id": region_id.0,
+                "epoch": epoch,
+            }))
+        }
+        ub_managed::AcquireWriterResult::Denied { reason, .. } => {
+            Json(json!({"status": "denied", "reason": reason}))
+        }
+        ub_managed::AcquireWriterResult::Queued { .. } => {
+            Json(json!({"status": "queued"}))
+        }
+        ub_managed::AcquireWriterResult::NotFound => {
+            Json(json!({"error": "region not found in coherence manager"}))
+        }
+    }
+}
+
+async fn release_writer(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ReleaseWriterRequest>,
+) -> Json<Value> {
+    if !state.config.managed.enabled {
+        return Json(json!({"error": "managed layer not enabled"}));
+    }
+
+    let va = match parse_va(&req.va) {
+        Ok(v) => v,
+        Err(e) => return Json(json!({"error": e})),
+    };
+
+    let region_id = va.region_id();
+
+    let released = state.coherence.release_writer(region_id, state.config.node_id);
+    if released {
+        let epoch = state.coherence.get_epoch(region_id).unwrap_or(0);
+        Json(json!({
+            "status": "ok",
+            "region_id": region_id.0,
+            "epoch": epoch,
+        }))
+    } else {
+        Json(json!({"error": "failed to release writer (not the current writer or region not found)"}))
+    }
+}
+
+/// Write to a remote region's home node via data plane.
+async fn write_va_remote(state: &Arc<AppState>, region: &RegionInfo, offset: u64, data: &[u8]) -> Json<Value> {
+    let ub_addr = UbAddr::new(
+        state.config.pod_id,
+        region.home_node_id,
+        region.device_id,
+        offset,
+        0,
+    );
+    let dp = state.dataplane.lock().await;
+    match dp.ub_write_remote(ub_addr, data).await {
+        Ok(()) => Json(json!({"status": "ok"})),
+        Err(e) => Json(json!({"error": format!("{}", e)})),
+    }
+}
+
+/// Parse a hex-encoded u128 virtual address.
+fn parse_va(s: &str) -> Result<UbVa, String> {
+    let s = s.trim_start_matches("0x").trim_start_matches("0X");
+    u128::from_str_radix(s, 16)
+        .map(UbVa)
+        .map_err(|e| format!("invalid virtual address: {e}"))
+}
+
 /// Notify a replica jetty about a KV slot update via write_with_imm.
 async fn notify_replica(state: &Arc<AppState>, replica_node_id: u16, replica_jetty_id: u32, slot: u32) {
     let src_jetty_id = state.jetty_table.default_jetty()
@@ -950,6 +1591,12 @@ async fn metrics_endpoint(State(state): State<Arc<AppState>>) -> impl axum::resp
 
     let jetty_count = state.jetty_table.list().len() as f64;
     ub_obs::set_gauge(ub_obs::JETTY_COUNT, jetty_count);
+
+    // Region count gauges by state
+    let (home, shared, invalid) = state.region_table.count_by_state();
+    ub_obs::set_gauge_label(ub_obs::REGION_COUNT, "state", "home", home as f64);
+    ub_obs::set_gauge_label(ub_obs::REGION_COUNT, "state", "shared", shared as f64);
+    ub_obs::set_gauge_label(ub_obs::REGION_COUNT, "state", "invalid", invalid as f64);
 
     let output = state.prom_handle.render();
     (

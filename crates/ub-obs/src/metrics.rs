@@ -25,6 +25,18 @@ pub const MR_COUNT: &str = "unibus_mr_count";
 pub const JETTY_COUNT: &str = "unibus_jetty_count";
 /// Peer RTT in milliseconds (histogram, optional).
 pub const PEER_RTT_MS: &str = "unibus_peer_rtt_ms";
+/// Total placement decisions, labelled by tier (M7).
+pub const PLACEMENT_DECISION: &str = "unibus_placement_decision_total";
+/// Region cache hit count (M7).
+pub const REGION_CACHE_HIT: &str = "unibus_region_cache_hit_total";
+/// Region cache miss count (M7).
+pub const REGION_CACHE_MISS: &str = "unibus_region_cache_miss_total";
+/// Total invalidation messages sent (M7).
+pub const INVALIDATE_SENT: &str = "unibus_invalidate_sent_total";
+/// Writer lock wait time in ms (M7, histogram).
+pub const WRITE_LOCK_WAIT_MS: &str = "unibus_write_lock_wait_ms";
+/// Current region count, labelled by state (M7).
+pub const REGION_COUNT: &str = "unibus_region_count";
 
 // ── Describe all metrics ───────────────────────────────────────────────
 
@@ -40,6 +52,12 @@ pub fn describe_metrics() {
     describe_gauge!(MR_COUNT, "Current MR count");
     describe_gauge!(JETTY_COUNT, "Current Jetty count");
     describe_histogram!(PEER_RTT_MS, "Peer RTT in milliseconds");
+    describe_counter!(PLACEMENT_DECISION, "Total placement decisions by tier");
+    describe_counter!(REGION_CACHE_HIT, "Region cache hit count");
+    describe_counter!(REGION_CACHE_MISS, "Region cache miss count");
+    describe_counter!(INVALIDATE_SENT, "Total invalidation messages sent");
+    describe_histogram!(WRITE_LOCK_WAIT_MS, "Writer lock wait time in ms");
+    describe_gauge!(REGION_COUNT, "Current region count by state");
 }
 
 // ── Inline helper functions (for non-label cases) ──────────────────────
@@ -54,6 +72,12 @@ pub fn incr(name: &'static str) {
 #[inline]
 pub fn incr_by(name: &'static str, delta: u64) {
     metrics::counter!(name).increment(delta);
+}
+
+/// Increment a counter by 1 with one static label.
+#[inline]
+pub fn incr_label(name: &'static str, label_key: &'static str, label_val: &'static str) {
+    metrics::counter!(name, label_key => label_val).increment(1);
 }
 
 /// Set a gauge value (no labels).

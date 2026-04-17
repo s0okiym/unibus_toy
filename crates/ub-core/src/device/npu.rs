@@ -4,7 +4,7 @@ use parking_lot::RwLock;
 
 use crate::device::Device;
 use crate::error::UbError;
-use crate::types::DeviceKind;
+use crate::types::{DeviceKind, StorageTier};
 
 /// Simulated NPU device — backing is a RwLock<Vec<u8>> (FR-DEV-2).
 /// device_id >= 1, auto-incremented per ub_npu_open call.
@@ -67,6 +67,26 @@ impl Device for NpuDevice {
 
     fn capacity(&self) -> u64 {
         self.capacity
+    }
+
+    fn tier(&self) -> StorageTier {
+        StorageTier::Hot
+    }
+
+    fn peak_read_bw_mbps(&self) -> u32 {
+        50_000
+    }
+
+    fn peak_write_bw_mbps(&self) -> u32 {
+        50_000
+    }
+
+    fn read_latency_ns_p50(&self) -> u32 {
+        50
+    }
+
+    fn write_latency_ns_p50(&self) -> u32 {
+        50
     }
 
     fn read(&self, offset: u64, buf: &mut [u8]) -> Result<(), UbError> {
@@ -178,6 +198,14 @@ mod tests {
         let dev = NpuDevice::new(1, 1);
         assert_eq!(dev.kind(), DeviceKind::Npu);
         assert!(dev.device_id() >= 1);
+    }
+
+    #[test]
+    fn test_npu_device_tier_is_hot() {
+        let dev = NpuDevice::new(1, 1);
+        assert_eq!(dev.tier(), StorageTier::Hot);
+        assert_eq!(dev.peak_read_bw_mbps(), 50_000);
+        assert_eq!(dev.read_latency_ns_p50(), 50);
     }
 
     #[test]
