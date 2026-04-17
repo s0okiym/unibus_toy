@@ -915,14 +915,39 @@ managed:
 
 ## 文档
 
+### 设计与需求
+
 | 文档 | 说明 |
 |---|---|
-| [docs/REQUIREMENTS.md](./docs/REQUIREMENTS.md) | 功能需求、用户故事、验收标准 |
-| [docs/DESIGN.md](./docs/DESIGN.md) | 详细设计：Part I verbs 层 / Part II managed 层 / Part III 测试与里程碑 |
-| [docs/PROGRESS_AUDIT.md](./docs/PROGRESS_AUDIT.md) | 全局进度盘点（FR 需求覆盖 + DESIGN.md 逐节审计） |
-| [docs/M7_DEV_SUMMARY.md](./docs/M7_DEV_SUMMARY.md) | M7 开发总结 |
-| [docs/M5_DEV_SUMMARY.md](./docs/M5_DEV_SUMMARY.md) | M5 开发总结 |
-| [docs/M4_DEV_SUMMARY.md](./docs/M4_DEV_SUMMARY.md) | M4 开发总结 |
+| [REQUIREMENTS.md](./docs/REQUIREMENTS.md) | 项目需求文档：项目背景、目标、术语表、用户故事、13 类功能需求（FR-ADDR ~ FR-DEV，共 65 项）、验收标准 |
+| [DESIGN.md](./docs/DESIGN.md) | 详细设计文档：Part I Verbs 层（§1–§12，架构/线协议/传输/流控/控制面/Jetty/Verbs API/错误/Fabric）；Part II Managed 层（§13–§18，动机/概念/API/机制/一致性）；Part III 共享交付物（§19–§23，验收/性能/里程碑/评审） |
+| [DETAIL_DESIGN.md](./docs/DETAIL_DESIGN.md) | 早期版详细设计：目录式总览，覆盖架构/编址/线协议/传输/流控/控制面/Jetty/Fabric/可观测/错误/配置/Managed 层/Demo/测试/里程碑，部分细节与 DESIGN.md 有差异以 DESIGN.md 为准 |
+| [IMPL_PLAN.md](./docs/IMPL_PLAN.md) | 总体实施计划：6 个里程碑（M1–M5, M7）拆分为 27 个增量步骤；原则：先骨架后填充、先单节点后分布式、先快乐路径后错误处理、先功能后性能；含 Cargo workspace 依赖图和 crate 构建顺序 |
+
+### 里程碑开发总结
+
+| 文档 | 说明 |
+|---|---|
+| [M1_TEST_REPORT.md](./docs/M1_TEST_REPORT.md) | M1 测试报告：双节点 TCP 控制面 SuperPod 组建、HELLO/HEARTBEAT 交换、Admin API、节点故障检测；9 个 crate、43 文件、6,820 行代码；含代码审计与问题修复记录 |
+| [M2_IMPL_PLAN.md](./docs/M2_IMPL_PLAN.md) | M2 实施计划：识别 M1 后 8 项缺口（MR_PUBLISH 发送侧未集成、无数据面 UDP 监听、无远程 verb 函数、无响应侧 dispatch、无 MR admin API 等），逐步实施方案 |
+| [M2_DEV_SUMMARY.md](./docs/M2_DEV_SUMMARY.md) | M2 开发总结：数据面实现 — MR_PUBLISH 发送侧集成、DataPlaneEngine（响应端 + 客户端）、远程 verb 执行（Write/Read/AtomicCas/AtomicFaa）、MR Admin API、unibusctl mr-list；双节点可通过 UB 地址交换数据 |
+| [M2_TEST_REPORT.md](./docs/M2_TEST_REPORT.md) | M2 测试报告：5 个 crate 81 项单元测试全通过；新增 MR_PUBLISH 事件、wire frame 构建、状态码-错误映射测试；E2E 测试通过 |
+| [M3_DEV_SUMMARY.md](./docs/M3_DEV_SUMMARY.md) | M3 开发总结：Jetty 抽象（JFS/JFR/JFC 队列）+ Send/Recv/Write_with_Imm 双边消息语义；节点可双边交换消息，并结合单边写 + 立即数通知 |
+| [M4_IMPL_PLAN.md](./docs/M4_IMPL_PLAN.md) | M4 实施计划：识别 9 项缺口（无序号、ACK/Credit 帧被丢弃、无重传队列/RTO、无去重/写幂等/读缓存、无信用追踪、无分片重组、控制面 Suspect 恢复 bug、无数据面对端清理），可靠传输+流控+故障检测实施步骤 |
+| [M4_DEV_SUMMARY.md](./docs/M4_DEV_SUMMARY.md) | M4 开发总结：可靠传输（FR-REL）+ 流控（FR-FLOW）+ 故障检测（FR-FAIL）；DedupWindow 滑动窗口去重、ACK/SACK 重传、信用流控、写路径幂等、读响应缓存；1% 丢包下数据面正常工作（至多一次语义） |
+| [M5_IMPL_PLAN.md](./docs/M5_IMPL_PLAN.md) | M5 实施计划：前置审计（M1–M4 完成，ub-obs 空壳，metrics 依赖未使用）；范围覆盖可观测（Prometheus metrics + tracing）、Benchmark（Criterion + CLI）、分布式 KV Demo；逐步实施与测试计划 |
+| [M5_DEV_SUMMARY.md](./docs/M5_DEV_SUMMARY.md) | M5 开发总结：Prometheus 兼容 metrics + /metrics 端点、tracing #[instrument] 注解、Criterion 微基准（write/read/atomic）、unibusctl bench CLI、分布式 KV Demo（Put/Get/CAS over UB verbs）；含 3 节点 E2E 测试脚本 |
+| [m5_future_work.md](./docs/m5_future_work.md) | M5 后续工作清单：对照 REQUIREMENTS/DESIGN 的缺口 — AIMD 拥塞控制、EWMA RTT + Karn 算法、SACK 快速重传（3 dup ACK）、大 payload 分片重组、MR 注销生命周期、其他未实现 FR 项 |
+| [M6_IMPL_PLAN.md](./docs/M6_IMPL_PLAN.md) | M6 实施计划：Verbs 层特性补全，目标 FR 覆盖率从 ~70% 提升到 ~80%；步骤包括远端 MR 权限校验、MR 注销三态机（Active/Revoking/Released + 异步 inflight 排空 + 超时）及其他 m5_future_work 中识别的缺口 |
+| [M6_DEV_SUMMARY.md](./docs/M6_DEV_SUMMARY.md) | M6 开发总结：Verbs 层特性补全 — 远端 MR 权限校验、MR 注销三态机（Active/Revoking/Released + 异步 inflight 排空 + 超时）；FR 覆盖率从 ~70% 提升至 ~80%；164 项单元测试 |
+| [M7_IMPL_PLAN.md](./docs/M7_IMPL_PLAN.md) | M7 实施计划：Managed 全局虚拟地址层（FR-GVA-1 ~ FR-GVA-6）提供 ub_alloc/ub_free/ub_read_va/ub_write_va API；架构含 DeviceProfile Registry、Placer、RegionTable、Coherence SM（Invalid/Shared/Home）、WriterGuard + Lease、FetchAgent、CachePool（LRU eviction）、SubAllocator；控制面扩展（DEVICE_PROFILE_PUBLISH、ALLOC_REQ/RESP、REGION_CREATE/DELETE、FETCH/FETCH_RESP） |
+| [M7_DEV_SUMMARY.md](./docs/M7_DEV_SUMMARY.md) | M7 开发总结：Managed 全局虚拟地址层 — DeviceProfile + Registry（StorageTier/DeviceKind/基于 cost 的 best_device 选择）、Placer、RegionTable、CoherenceSM、WriterGuard、FetchAgent、CachePool（LRU）；ub_alloc/ub_free/ub_read_va/ub_write_va 让应用无需持有 NodeID；254 项单元测试、12 步 E2E 全通过 |
+
+### 进度盘点
+
+| 文档 | 说明 |
+|---|---|
+| [PROGRESS_AUDIT.md](./docs/PROGRESS_AUDIT.md) | 全局进度盘点：16,020 行 Rust、254 单元测试、6 套 E2E；7 个里程碑全部完成；按 FR-* 逐项审计（64/64 强制 + 6/6 可选 100% 覆盖）；DESIGN.md §1–§23 逐节实现度；Admin API 31 端点 + 15 Prometheus 指标清单；已知差距与剩余工作优先级排序 |
 
 ---
 
