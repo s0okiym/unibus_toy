@@ -230,6 +230,118 @@ impl MemberDownPayload {
     }
 }
 
+/// JOIN message payload (FR-CTRL-1 seed mode).
+#[derive(Debug, Clone)]
+pub struct JoinPayload {
+    pub node_id: u16,
+    pub epoch: u32,
+    pub data_addr: String,
+    pub control_addr: String,
+    pub initial_credits: u32,
+}
+
+impl JoinPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let data_bytes = self.data_addr.as_bytes();
+        let ctrl_bytes = self.control_addr.as_bytes();
+        let mut buf = Vec::with_capacity(14 + data_bytes.len() + ctrl_bytes.len());
+        buf.put_u16(self.node_id);
+        buf.put_u32(self.epoch);
+        buf.put_u32(data_bytes.len() as u32);
+        buf.put_slice(data_bytes);
+        buf.put_u32(ctrl_bytes.len() as u32);
+        buf.put_slice(ctrl_bytes);
+        buf.put_u32(self.initial_credits);
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, UbError> {
+        let mut cur = Cursor::new(data);
+        let node_id = cur.read_u16::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))?;
+        let epoch = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))?;
+        let data_len = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))? as usize;
+        let mut data_buf = vec![0u8; data_len];
+        cur.read_exact(&mut data_buf).map_err(|e| UbError::Internal(e.to_string()))?;
+        let data_addr = String::from_utf8(data_buf)
+            .map_err(|e| UbError::Internal(format!("invalid data_addr: {e}")))?;
+        let ctrl_len = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))? as usize;
+        let mut ctrl_buf = vec![0u8; ctrl_len];
+        cur.read_exact(&mut ctrl_buf).map_err(|e| UbError::Internal(e.to_string()))?;
+        let control_addr = String::from_utf8(ctrl_buf)
+            .map_err(|e| UbError::Internal(format!("invalid control_addr: {e}")))?;
+        let initial_credits = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))?;
+        Ok(JoinPayload {
+            node_id,
+            epoch,
+            data_addr,
+            control_addr,
+            initial_credits,
+        })
+    }
+}
+
+/// Single node info entry in a MemberSnapshot (FR-CTRL-1).
+#[derive(Debug, Clone)]
+pub struct SnapshotNodeInfo {
+    pub node_id: u16,
+    pub state: u8,
+    pub data_addr: String,
+    pub control_addr: String,
+    pub epoch: u32,
+}
+
+/// MEMBER_SNAPSHOT message payload (FR-CTRL-1 seed mode).
+#[derive(Debug, Clone)]
+pub struct MemberSnapshotPayload {
+    pub nodes: Vec<SnapshotNodeInfo>,
+}
+
+impl MemberSnapshotPayload {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.put_u32(self.nodes.len() as u32);
+        for node in &self.nodes {
+            buf.put_u16(node.node_id);
+            buf.put_u8(node.state);
+            buf.put_u32(node.epoch);
+            buf.put_u32(node.data_addr.len() as u32);
+            buf.put_slice(node.data_addr.as_bytes());
+            buf.put_u32(node.control_addr.len() as u32);
+            buf.put_slice(node.control_addr.as_bytes());
+        }
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, UbError> {
+        let mut cur = Cursor::new(data);
+        let count = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))? as usize;
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let node_id = cur.read_u16::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))?;
+            let state = cur.read_u8().map_err(|e| UbError::Internal(e.to_string()))?;
+            let epoch = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))?;
+            let data_len = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))? as usize;
+            let mut data_buf = vec![0u8; data_len];
+            cur.read_exact(&mut data_buf).map_err(|e| UbError::Internal(e.to_string()))?;
+            let data_addr = String::from_utf8(data_buf)
+                .map_err(|e| UbError::Internal(format!("invalid data_addr: {e}")))?;
+            let ctrl_len = cur.read_u32::<BigEndian>().map_err(|e| UbError::Internal(e.to_string()))? as usize;
+            let mut ctrl_buf = vec![0u8; ctrl_len];
+            cur.read_exact(&mut ctrl_buf).map_err(|e| UbError::Internal(e.to_string()))?;
+            let control_addr = String::from_utf8(ctrl_buf)
+                .map_err(|e| UbError::Internal(format!("invalid control_addr: {e}")))?;
+            nodes.push(SnapshotNodeInfo {
+                node_id,
+                state,
+                data_addr,
+                control_addr,
+                epoch,
+            });
+        }
+        Ok(MemberSnapshotPayload { nodes })
+    }
+}
+
 /// Control message enum — all control plane messages.
 #[derive(Debug, Clone)]
 pub enum ControlMsg {
@@ -237,10 +349,12 @@ pub enum ControlMsg {
     HelloAck(HelloPayload),
     MemberUp(HelloPayload), // Same payload as Hello — carries node info
     MemberDown(MemberDownPayload),
+    MemberSnapshot(MemberSnapshotPayload),
     Heartbeat(HeartbeatPayload),
     HeartbeatAck(HeartbeatPayload),
     MrPublish(MrPublishPayload),
     MrRevoke(MrRevokePayload),
+    Join(JoinPayload),
 }
 
 impl ControlMsg {
@@ -250,10 +364,12 @@ impl ControlMsg {
             ControlMsg::HelloAck(_) => CtrlMsgType::HelloAck,
             ControlMsg::MemberUp(_) => CtrlMsgType::MemberUp,
             ControlMsg::MemberDown(_) => CtrlMsgType::MemberDown,
+            ControlMsg::MemberSnapshot(_) => CtrlMsgType::MemberSnapshot,
             ControlMsg::Heartbeat(_) => CtrlMsgType::Heartbeat,
             ControlMsg::HeartbeatAck(_) => CtrlMsgType::HeartbeatAck,
             ControlMsg::MrPublish(_) => CtrlMsgType::MrPublish,
             ControlMsg::MrRevoke(_) => CtrlMsgType::MrRevoke,
+            ControlMsg::Join(_) => CtrlMsgType::Join,
         }
     }
 
@@ -263,10 +379,12 @@ impl ControlMsg {
             ControlMsg::HelloAck(p) => p.encode(),
             ControlMsg::MemberUp(p) => p.encode(),
             ControlMsg::MemberDown(p) => p.encode(),
+            ControlMsg::MemberSnapshot(p) => p.encode(),
             ControlMsg::Heartbeat(p) => p.encode(),
             ControlMsg::HeartbeatAck(p) => p.encode(),
             ControlMsg::MrPublish(p) => p.encode(),
             ControlMsg::MrRevoke(p) => p.encode(),
+            ControlMsg::Join(p) => p.encode(),
         }
     }
 
@@ -284,11 +402,12 @@ impl ControlMsg {
             CtrlMsgType::HelloAck => Ok(ControlMsg::HelloAck(HelloPayload::decode(&payload)?)),
             CtrlMsgType::MemberUp => Ok(ControlMsg::MemberUp(HelloPayload::decode(&payload)?)),
             CtrlMsgType::MemberDown => Ok(ControlMsg::MemberDown(MemberDownPayload::decode(&payload)?)),
+            CtrlMsgType::MemberSnapshot => Ok(ControlMsg::MemberSnapshot(MemberSnapshotPayload::decode(&payload)?)),
             CtrlMsgType::Heartbeat => Ok(ControlMsg::Heartbeat(HeartbeatPayload::decode(&payload)?)),
             CtrlMsgType::HeartbeatAck => Ok(ControlMsg::HeartbeatAck(HeartbeatPayload::decode(&payload)?)),
             CtrlMsgType::MrPublish => Ok(ControlMsg::MrPublish(MrPublishPayload::decode(&payload)?)),
             CtrlMsgType::MrRevoke => Ok(ControlMsg::MrRevoke(MrRevokePayload::decode(&payload)?)),
-            _ => Err(UbError::Internal(format!("unhandled ctrl msg type: {:?}", msg_type as u8))),
+            CtrlMsgType::Join => Ok(ControlMsg::Join(JoinPayload::decode(&payload)?)),
         }
     }
 }
@@ -397,6 +516,99 @@ mod tests {
             assert_eq!(d.reason, 1);
         } else {
             panic!("expected MemberDown");
+        }
+    }
+
+    #[test]
+    fn test_join_payload_roundtrip() {
+        let join = JoinPayload {
+            node_id: 10,
+            epoch: 555,
+            data_addr: "10.0.0.10:7901".to_string(),
+            control_addr: "10.0.0.10:7900".to_string(),
+            initial_credits: 32,
+        };
+        let encoded = join.encode();
+        let decoded = JoinPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.node_id, 10);
+        assert_eq!(decoded.epoch, 555);
+        assert_eq!(decoded.data_addr, "10.0.0.10:7901");
+        assert_eq!(decoded.control_addr, "10.0.0.10:7900");
+        assert_eq!(decoded.initial_credits, 32);
+    }
+
+    #[test]
+    fn test_member_snapshot_roundtrip() {
+        let snapshot = MemberSnapshotPayload {
+            nodes: vec![
+                SnapshotNodeInfo {
+                    node_id: 1,
+                    state: 1, // Active
+                    data_addr: "10.0.0.1:7901".to_string(),
+                    control_addr: "10.0.0.1:7900".to_string(),
+                    epoch: 100,
+                },
+                SnapshotNodeInfo {
+                    node_id: 2,
+                    state: 1,
+                    data_addr: "10.0.0.2:7901".to_string(),
+                    control_addr: "10.0.0.2:7900".to_string(),
+                    epoch: 200,
+                },
+            ],
+        };
+        let encoded = snapshot.encode();
+        let decoded = MemberSnapshotPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.nodes.len(), 2);
+        assert_eq!(decoded.nodes[0].node_id, 1);
+        assert_eq!(decoded.nodes[0].state, 1);
+        assert_eq!(decoded.nodes[0].data_addr, "10.0.0.1:7901");
+        assert_eq!(decoded.nodes[0].control_addr, "10.0.0.1:7900");
+        assert_eq!(decoded.nodes[0].epoch, 100);
+        assert_eq!(decoded.nodes[1].node_id, 2);
+        assert_eq!(decoded.nodes[1].epoch, 200);
+    }
+
+    #[test]
+    fn test_join_control_msg_roundtrip() {
+        let msg = ControlMsg::Join(JoinPayload {
+            node_id: 5,
+            epoch: 42,
+            data_addr: "192.168.1.5:7901".to_string(),
+            control_addr: "192.168.1.5:7900".to_string(),
+            initial_credits: 64,
+        });
+        let encoded = msg.encode();
+        let decoded = ControlMsg::decode(&encoded).unwrap();
+        if let ControlMsg::Join(j) = decoded {
+            assert_eq!(j.node_id, 5);
+            assert_eq!(j.epoch, 42);
+            assert_eq!(j.data_addr, "192.168.1.5:7901");
+            assert_eq!(j.control_addr, "192.168.1.5:7900");
+            assert_eq!(j.initial_credits, 64);
+        } else {
+            panic!("expected Join");
+        }
+    }
+
+    #[test]
+    fn test_member_snapshot_control_msg_roundtrip() {
+        let msg = ControlMsg::MemberSnapshot(MemberSnapshotPayload {
+            nodes: vec![SnapshotNodeInfo {
+                node_id: 3,
+                state: 1,
+                data_addr: "10.0.0.3:7901".to_string(),
+                control_addr: "10.0.0.3:7900".to_string(),
+                epoch: 300,
+            }],
+        });
+        let encoded = msg.encode();
+        let decoded = ControlMsg::decode(&encoded).unwrap();
+        if let ControlMsg::MemberSnapshot(s) = decoded {
+            assert_eq!(s.nodes.len(), 1);
+            assert_eq!(s.nodes[0].node_id, 3);
+        } else {
+            panic!("expected MemberSnapshot");
         }
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 use crate::addr::UbAddr;
 use crate::device::Device;
@@ -20,6 +20,8 @@ pub struct MrEntry {
     pub base_ub_addr: UbAddr,
     state: AtomicU8,
     pub inflight_refs: AtomicI64,
+    /// Notified when inflight_refs drops to zero (used by deregister wait).
+    inflight_notify: Notify,
 }
 
 impl MrEntry {
@@ -48,8 +50,17 @@ impl MrEntry {
     pub fn inflight_dec(&self) {
         let prev = self.inflight_refs.fetch_sub(1, Ordering::Release);
         if prev == 1 {
-            // Last inflight reference released — could notify deregister waiter
+            // Last inflight reference released — notify deregister waiter
+            self.inflight_notify.notify_waiters();
         }
+    }
+
+    /// Wait for inflight_refs to reach zero. Used by deregister_async.
+    pub async fn wait_inflight_zero(&self) {
+        if self.inflight_refs.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        self.inflight_notify.notified().await;
     }
 
     /// Check that the MR's permissions allow the requested verb.
@@ -183,6 +194,7 @@ impl MrTable {
             base_ub_addr,
             state: AtomicU8::new(MrState::Active as u8),
             inflight_refs: AtomicI64::new(0),
+            inflight_notify: Notify::new(),
         });
 
         self.entries.insert(handle, entry);
@@ -202,15 +214,28 @@ impl MrTable {
         Ok((base_ub_addr, MrHandle(handle)))
     }
 
-    /// Deregister an MR. First version: simple — just remove it.
-    /// Full inflight ref-count handling comes in Step 6.7.
+    /// Deregister an MR. Transitions state to Revoking, then removes the entry.
+    /// If inflight operations are ongoing, they will be rejected (try_inflight_inc returns false).
+    /// For async wait with timeout, use `deregister_async`.
     pub fn deregister(&self, handle: MrHandle) -> Result<(), UbError> {
-        let entry = self.entries.remove(&handle.0);
-        if entry.is_none() {
-            return Err(UbError::AddrInvalid);
+        let entry_ref = match self.entries.get_mut(&handle.0) {
+            Some(e) => e,
+            None => return Err(UbError::AddrInvalid),
+        };
+        let entry = entry_ref.value();
+
+        // CAS Active → Revoking
+        let prev = entry.state.compare_exchange(
+            MrState::Active as u8,
+            MrState::Revoking as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if prev.is_err() {
+            return Err(UbError::Internal("MR is already being deregistered or released".into()));
         }
 
-        // Notify control plane about the MR removal
+        // Broadcast MR_REVOKE while still in table (so responders can see Revoking state)
         if let Some(ref tx) = self.publish_tx {
             let _ = tx.send(MrPublishEvent::Revoke {
                 owner_node: self.node_id,
@@ -218,10 +243,66 @@ impl MrTable {
             });
         }
 
+        drop(entry_ref);
+
+        // Remove from table — new lookups will return None
+        self.entries.remove(&handle.0);
+
         Ok(())
     }
 
-    /// Look up an MR by handle.
+    /// Async deregister: waits for inflight operations to complete, with timeout.
+    /// Returns Ok(()) if inflight drained and MR released.
+    /// Returns Err(Timeout) if inflight did not drain within timeout_ms.
+    pub async fn deregister_async(&self, handle: MrHandle, timeout_ms: u64) -> Result<(), UbError> {
+        let entry_arc = match self.entries.get(&handle.0) {
+            Some(e) => Arc::clone(e.value()),
+            None => return Err(UbError::AddrInvalid),
+        };
+
+        // CAS Active → Revoking
+        let prev = entry_arc.state.compare_exchange(
+            MrState::Active as u8,
+            MrState::Revoking as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        if prev.is_err() {
+            return Err(UbError::Internal("MR is already being deregistered or released".into()));
+        }
+
+        // Broadcast MR_REVOKE immediately after entering Revoking
+        if let Some(ref tx) = self.publish_tx {
+            let _ = tx.send(MrPublishEvent::Revoke {
+                owner_node: self.node_id,
+                mr_handle: handle.0,
+            });
+        }
+
+        // Wait for inflight refs to drain (with timeout)
+        if entry_arc.inflight_refs.load(Ordering::Acquire) > 0 {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                entry_arc.wait_inflight_zero(),
+            ).await;
+
+            if result.is_err() {
+                // Timeout — mark as Released anyway (best effort for toy)
+                entry_arc.set_state(MrState::Released);
+                self.entries.remove(&handle.0);
+                return Err(UbError::Timeout);
+            }
+        }
+
+        // All inflight drained — transition to Released and remove
+        entry_arc.set_state(MrState::Released);
+        self.entries.remove(&handle.0);
+
+        Ok(())
+    }
+
+    /// Look up an MR by handle. Returns the entry even if in Revoking state
+    /// (callers should check `entry.state()` and use `try_inflight_inc()`).
     pub fn lookup(&self, handle: u32) -> Option<Arc<MrEntry>> {
         self.entries.get(&handle).map(|r| Arc::clone(r.value()))
     }
@@ -492,9 +573,97 @@ mod tests {
         // MrTable without channel should work exactly as before
         let table = MrTable::new(1, 42);
         let dev = Arc::new(MemoryDevice::new(4096));
-        let (addr, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
+        let (_addr, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
         assert!(table.lookup(handle.0).is_some());
         table.deregister(handle).unwrap();
         assert!(table.lookup(handle.0).is_none());
+    }
+
+    #[test]
+    fn test_mr_deregister_revoking_state() {
+        let table = MrTable::new(1, 42);
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (_, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
+
+        // Deregister should transition state to Revoking then remove
+        // After deregister, lookup should return None
+        table.deregister(handle).unwrap();
+        assert!(table.lookup(handle.0).is_none());
+
+        // Verify that a new MR with inflight refs blocks try_inflight_inc when Revoking
+        let dev2 = Arc::new(MemoryDevice::new(4096));
+        let (_, handle2) = table.register(dev2, 1024, MrPerms::READ).unwrap();
+        let entry = table.lookup(handle2.0).unwrap();
+        // Manually set to Revoking — try_inflight_inc should fail
+        entry.set_state(MrState::Revoking);
+        assert!(!entry.try_inflight_inc());
+    }
+
+    #[tokio::test]
+    async fn test_mr_deregister_waits_inflight() {
+        let table = MrTable::new(1, 42);
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (_, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
+
+        let entry = table.lookup(handle.0).unwrap();
+        // Simulate an inflight operation
+        assert!(entry.try_inflight_inc());
+        assert_eq!(entry.inflight_refs.load(Ordering::Acquire), 1);
+
+        // Spawn deregister_async in a separate task — it should wait
+
+        // Use a real scenario: start deregister_async, then release inflight
+        let entry_arc = table.entries.get(&handle.0).map(|r| Arc::clone(r.value())).unwrap();
+
+        // Transition to Revoking manually (deregister_async would do this)
+        entry_arc.state.store(MrState::Revoking as u8, Ordering::Release);
+
+        // Spawn a task that waits for inflight to drain
+        let wait_task = tokio::spawn(async move {
+            entry_arc.wait_inflight_zero().await;
+        });
+
+        // Release the inflight ref
+        entry.inflight_dec();
+
+        // The wait task should complete quickly
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), wait_task).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mr_deregister_timeout() {
+        let (table, _rx) = MrTable::new_with_channel(1, 42);
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (_, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
+
+        let entry = table.lookup(handle.0).unwrap();
+        // Simulate an inflight operation that won't complete
+        assert!(entry.try_inflight_inc());
+
+        // deregister_async with a very short timeout should return Timeout
+        let result = table.deregister_async(crate::types::MrHandle(handle.0), 10).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            UbError::Timeout => {} // expected
+            e => panic!("expected Timeout, got {:?}", e),
+        }
+
+        // Cleanup: release the inflight ref
+        entry.inflight_dec();
+    }
+
+    #[test]
+    fn test_mr_deregister_already_revoking() {
+        let table = MrTable::new(1, 42);
+        let dev = Arc::new(MemoryDevice::new(4096));
+        let (_, handle) = table.register(dev, 1024, MrPerms::READ).unwrap();
+
+        // First deregister should succeed
+        table.deregister(handle).unwrap();
+
+        // Second deregister should fail (entry already removed)
+        let result = table.deregister(handle);
+        assert!(result.is_err());
     }
 }

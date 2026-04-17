@@ -116,7 +116,12 @@ struct KvInitRequest {
     /// Number of KV slots (default 16)
     #[serde(default = "default_kv_slots")]
     slots: u32,
+    /// Device kind: "memory" (default) or "npu"
+    #[serde(default = "default_device_kind")]
+    device_kind: String,
 }
+
+fn default_device_kind() -> String { "memory".to_string() }
 
 fn default_kv_slots() -> u32 { 16 }
 
@@ -126,6 +131,12 @@ struct KvPutRequest {
     slot: u32,
     key: String,
     value: String,
+    /// Optional: send write_with_imm notification to replica jetty
+    #[serde(default)]
+    replica_node_id: Option<u16>,
+    /// Optional: replica jetty ID for notification
+    #[serde(default)]
+    replica_jetty_id: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +153,12 @@ struct KvCasRequest {
     key: String,
     expect_version: u64,
     value: String,
+    /// Optional: send write_with_imm notification to replica jetty on CAS success
+    #[serde(default)]
+    replica_node_id: Option<u16>,
+    /// Optional: replica jetty ID for notification
+    #[serde(default)]
+    replica_jetty_id: Option<u32>,
 }
 
 fn parse_ub_addr(s: &str) -> Result<UbAddr, String> {
@@ -408,7 +425,8 @@ async fn mr_deregister(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MrDeregisterRequest>,
 ) -> Json<Value> {
-    match state.mr_table.deregister(ub_core::types::MrHandle(req.mr_handle)) {
+    let timeout_ms = state.config.mr.deregister_timeout_ms;
+    match state.mr_table.deregister_async(ub_core::types::MrHandle(req.mr_handle), timeout_ms).await {
         Ok(()) => Json(json!({"status": "ok"})),
         Err(e) => Json(json!({"error": format!("{}", e)})),
     }
@@ -551,9 +569,9 @@ async fn verb_send(
         jetty_id: req.dst_jetty_id,
     };
 
-    // Use default jetty (handle=1) if it exists, otherwise 0
-    let src_jetty_id = state.jetty_table.list().first()
-        .map(|j| j.handle.0)
+    // Use default jetty if it exists
+    let src_jetty_id = state.jetty_table.default_jetty()
+        .map(|h| h.0)
         .unwrap_or(0);
 
     let dp = state.dataplane.lock().await;
@@ -574,8 +592,8 @@ async fn verb_send_with_imm(
 
     let imm = req.imm.unwrap_or(0);
 
-    let src_jetty_id = state.jetty_table.list().first()
-        .map(|j| j.handle.0)
+    let src_jetty_id = state.jetty_table.default_jetty()
+        .map(|h| h.0)
         .unwrap_or(0);
 
     let dp = state.dataplane.lock().await;
@@ -599,8 +617,8 @@ async fn verb_write_imm(
         jetty_id: req.dst_jetty_id,
     };
 
-    let src_jetty_id = state.jetty_table.list().first()
-        .map(|j| j.handle.0)
+    let src_jetty_id = state.jetty_table.default_jetty()
+        .map(|h| h.0)
         .unwrap_or(0);
 
     let dp = state.dataplane.lock().await;
@@ -617,7 +635,12 @@ async fn kv_init(
     Json(req): Json<KvInitRequest>,
 ) -> Json<Value> {
     let total_len = req.slots as u64 * KV_SLOT_SIZE as u64;
-    let dev: Arc<dyn Device> = Arc::new(MemoryDevice::new(total_len as usize));
+    let dev: Arc<dyn Device> = if req.device_kind == "npu" {
+        let size_mib = (total_len + 1024 * 1024 - 1) / (1024 * 1024);
+        Arc::new(ub_core::device::npu::NpuDevice::new(1, size_mib.max(1)))
+    } else {
+        Arc::new(MemoryDevice::new(total_len as usize))
+    };
     match state.mr_table.register(dev, total_len, MrPerms::READ | MrPerms::WRITE | MrPerms::ATOMIC) {
         Ok((addr, handle)) => {
             // Initialize all slots: version=0, key and value zeroed
@@ -677,6 +700,11 @@ async fn kv_put(
             return Json(json!({"error": format!("{}", e)}));
         }
 
+        // Notify replica if configured
+        if let (Some(replica_node), Some(replica_jetty)) = (req.replica_node_id, req.replica_jetty_id) {
+            notify_replica(&state, replica_node, replica_jetty, req.slot).await;
+        }
+
         Json(json!({"status": "ok", "version": new_version}))
     } else {
         // Remote MR — use data-plane verbs
@@ -713,7 +741,14 @@ async fn kv_put(
         kv_data[KV_KEY_LEN..KV_KEY_LEN + copy_len].copy_from_slice(&value_bytes[..copy_len]);
 
         match dp.ub_write_remote(write_addr, &kv_data).await {
-            Ok(()) => Json(json!({"status": "ok", "version": new_version})),
+            Ok(()) => {
+                // Notify replica if configured
+                if let (Some(replica_node), Some(replica_jetty)) = (req.replica_node_id, req.replica_jetty_id) {
+                    drop(dp);
+                    notify_replica(&state, replica_node, replica_jetty, req.slot).await;
+                }
+                Json(json!({"status": "ok", "version": new_version}))
+            }
             Err(e) => Json(json!({"error": format!("{}", e)})),
         }
     }
@@ -816,6 +851,11 @@ async fn kv_cas(
             let data_offset = offset_in_mr + slot_offset;
             let _ = entry.device.write(data_offset, &slot_data);
 
+            // Notify replica if configured
+            if let (Some(replica_node), Some(replica_jetty)) = (req.replica_node_id, req.replica_jetty_id) {
+                notify_replica(&state, replica_node, replica_jetty, req.slot).await;
+            }
+
             Json(json!({"status": "ok", "old_version": old_value, "new_version": new_version}))
         } else {
             Json(json!({"status": "cas_failed", "current_version": old_value, "expected_version": req.expect_version}))
@@ -853,6 +893,12 @@ async fn kv_cas(
 
                     let _ = dp.ub_write_remote(write_addr, &slot_data).await;
 
+                    // Notify replica if configured
+                    if let (Some(replica_node), Some(replica_jetty)) = (req.replica_node_id, req.replica_jetty_id) {
+                        drop(dp);
+                        notify_replica(&state, replica_node, replica_jetty, req.slot).await;
+                    }
+
                     Json(json!({"status": "ok", "old_version": old_value, "new_version": new_version}))
                 } else {
                     Json(json!({"status": "cas_failed", "current_version": old_value, "expected_version": req.expect_version}))
@@ -861,6 +907,22 @@ async fn kv_cas(
             Err(e) => Json(json!({"error": format!("{}", e)})),
         }
     }
+}
+
+/// Notify a replica jetty about a KV slot update via write_with_imm.
+async fn notify_replica(state: &Arc<AppState>, replica_node_id: u16, replica_jetty_id: u32, slot: u32) {
+    let src_jetty_id = state.jetty_table.default_jetty()
+        .map(|h| h.0)
+        .unwrap_or(0);
+
+    let dst_jetty = JettyAddr {
+        node_id: replica_node_id,
+        jetty_id: replica_jetty_id,
+    };
+
+    let dp = state.dataplane.lock().await;
+    // Send an empty payload with imm = slot index as notification
+    let _ = dp.ub_send_with_imm_remote(src_jetty_id, dst_jetty, &[], slot as u64).await;
 }
 
 /// Pad a string with null bytes to the specified length.

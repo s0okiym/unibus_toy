@@ -67,6 +67,26 @@ pub struct ReliableSession {
     /// Maximum number of retries before giving up.
     pub max_retries: u32,
 
+    // === AIMD congestion control ===
+    /// Congestion window (in frames).
+    pub cwnd: u32,
+    /// Slow-start threshold.
+    pub ssthresh: u32,
+
+    // === EWMA RTT estimation ===
+    /// Smoothed RTT in milliseconds.
+    pub srtt: f64,
+    /// RTT variance in milliseconds.
+    pub rttvar: f64,
+    /// Dynamic RTO in milliseconds (srtt + 4*rttvar, clamped to [200, 60000]).
+    pub rto: u64,
+
+    // === SACK fast retransmit ===
+    /// Duplicate ACK count — incremented when ACK doesn't advance ack_seq but has new SACK.
+    pub dup_ack_count: u32,
+    /// Last ack_seq seen (for duplicate ACK detection).
+    pub last_ack_seq: u64,
+
     // === Receive side ===
     /// Dedup window for at-most-once semantics.
     pub dedup: DedupWindow,
@@ -90,6 +110,7 @@ impl ReliableSession {
         max_retries: u32,
         initial_credits: u32,
     ) -> Self {
+        let rto = rto_base_ms.max(200).min(60000);
         ReliableSession {
             key: SessionKey { local_node, remote_node, epoch },
             state: SessionState::Active,
@@ -98,6 +119,13 @@ impl ReliableSession {
             retransmit_queue: VecDeque::new(),
             rto_base_ms,
             max_retries,
+            cwnd: initial_credits,
+            ssthresh: u32::MAX,
+            srtt: rto_base_ms as f64,
+            rttvar: rto_base_ms as f64 / 2.0,
+            rto,
+            dup_ack_count: 0,
+            last_ack_seq: 0,
             dedup: DedupWindow::new(1),
             execution_records: VecDeque::new(),
             read_cache: ReadResponseCache::default_cache(),
@@ -138,7 +166,7 @@ impl ReliableSession {
         }
 
         // Store in retransmit queue
-        let rto = Duration::from_millis(self.rto_base_ms);
+        let rto = Duration::from_millis(self.rto);
         self.retransmit_queue.push_back(RetransmitEntry {
             seq,
             frame: frame.to_vec(),
@@ -154,9 +182,11 @@ impl ReliableSession {
 
     /// Process an ACK payload — remove acknowledged fire-and-forget entries from the retransmit queue.
     /// Request-response entries are kept (they need retransmission until the response is received).
+    /// Also updates RTT estimation (Karn algorithm) and AIMD state.
     /// Returns the list of removed entries (for any cleanup needed).
     pub fn process_ack(&mut self, ack: &AckPayload) -> Vec<RetransmitEntry> {
         let ack_seq = ack.ack_seq;
+        let is_new_ack = ack_seq > self.last_ack_seq;
 
         // Remove fire-and-forget entries that have been ACKed.
         // Keep request-response entries — they may need retransmission if the response is lost.
@@ -165,6 +195,13 @@ impl ReliableSession {
 
         while let Some(entry) = self.retransmit_queue.pop_front() {
             if entry.seq <= ack_seq && entry.is_fire_and_forget {
+                // RTT sample: only for non-retransmitted frames (Karn algorithm)
+                if is_new_ack && entry.retry_count == 0 {
+                    let sample_ms = entry.first_sent_at.elapsed().as_millis() as f64;
+                    if sample_ms > 0.0 {
+                        self.update_rtt(sample_ms);
+                    }
+                }
                 removed.push(entry);
             } else {
                 keep.push_back(entry);
@@ -175,6 +212,11 @@ impl ReliableSession {
 
         // Add credits from the ACK
         self.add_credits(ack.credit_grant);
+
+        // AIMD: update on new ACK
+        if is_new_ack {
+            self.on_new_ack();
+        }
 
         removed
     }
@@ -246,6 +288,82 @@ impl ReliableSession {
         Ok(())
     }
 
+    /// Check how many frames can be sent (congestion window minus outstanding).
+    /// Returns 0 if congestion-limited.
+    pub fn send_available(&self) -> u32 {
+        let outstanding = self.retransmit_queue.len() as u32;
+        self.cwnd.saturating_sub(outstanding)
+    }
+
+    /// Update RTT estimation with a new sample (Karn algorithm).
+    /// Only called for non-retransmitted frames.
+    pub fn update_rtt(&mut self, sample_ms: f64) {
+        // EWMA: srtt = 0.875 * srtt + 0.125 * sample
+        self.srtt = 0.875 * self.srtt + 0.125 * sample_ms;
+        // rttvar = 0.75 * rttvar + 0.25 * |sample - srtt|
+        self.rttvar = 0.75 * self.rttvar + 0.25 * (sample_ms - self.srtt).abs();
+        // RTO = srtt + 4 * rttvar, clamped to [200ms, 60000ms]
+        self.rto = (self.srtt + 4.0 * self.rttvar).round() as u64;
+        self.rto = self.rto.max(200).min(60000);
+    }
+
+    /// AIMD: handle new ACK (ack_seq advanced).
+    /// In slow start, cwnd doubles. In congestion avoidance, cwnd grows linearly.
+    pub fn on_new_ack(&mut self) {
+        if self.cwnd < self.ssthresh {
+            // Slow start: exponential growth
+            self.cwnd = self.cwnd.saturating_mul(2);
+        } else {
+            // Congestion avoidance: additive increase (1 MSS per RTT)
+            self.cwnd += 1;
+        }
+        // Reset dup ACK count
+        self.dup_ack_count = 0;
+    }
+
+    /// AIMD: handle packet loss (timeout or 3 dup ACKs).
+    /// Multiplicative decrease: ssthresh = cwnd/2, cwnd = 1.
+    pub fn on_loss(&mut self) {
+        self.ssthresh = self.cwnd / 2;
+        if self.ssthresh < 2 {
+            self.ssthresh = 2;
+        }
+        self.cwnd = 1;
+        self.dup_ack_count = 0;
+    }
+
+    /// Process an ACK for SACK fast retransmit detection.
+    /// Returns Some(seq) if 3 duplicate ACKs detected (fast retransmit needed).
+    /// Returns None otherwise.
+    pub fn process_ack_for_fast_retransmit(&mut self, ack: &AckPayload) -> Option<u64> {
+        let ack_seq = ack.ack_seq;
+
+        if ack_seq > self.last_ack_seq {
+            // New ACK — ack_seq advanced
+            self.last_ack_seq = ack_seq;
+            self.dup_ack_count = 0;
+            None
+        } else if ack.sack_bitmap.is_some() {
+            // Duplicate ACK with SACK — possible gap fill
+            self.dup_ack_count += 1;
+            if self.dup_ack_count >= 3 {
+                self.dup_ack_count = 0; // Reset after triggering
+                Some(ack_seq + 1) // Retransmit the first unacked frame
+            } else {
+                None
+            }
+        } else {
+            // Duplicate ACK without SACK — just count
+            self.dup_ack_count += 1;
+            if self.dup_ack_count >= 3 {
+                self.dup_ack_count = 0;
+                Some(ack_seq + 1)
+            } else {
+                None
+            }
+        }
+    }
+
     /// Kill the session — mark as Dead and return all unacknowledged entries.
     pub fn kill(&mut self) -> Vec<RetransmitEntry> {
         self.state = SessionState::Dead;
@@ -309,6 +427,11 @@ impl ReliableSession {
         if should_kill {
             self.kill();
             return Vec::new(); // Session is dead, caller handles it
+        }
+
+        // AIMD: on RTO timeout, multiplicative decrease
+        if !timeout_seqs.is_empty() {
+            self.on_loss();
         }
 
         timeout_seqs
@@ -554,5 +677,132 @@ mod tests {
             session.frames_since_last_ack += 1;
         }
         assert!(session.should_send_ack());
+    }
+
+    #[test]
+    fn test_aimd_slow_start() {
+        let mut session = ReliableSession::new(1, 2, 100, 200, 8, 4);
+        // cwnd starts at initial_credits = 4, ssthresh = MAX
+        assert_eq!(session.cwnd, 4);
+
+        // Slow start: cwnd doubles on each new ACK
+        session.on_new_ack();
+        assert_eq!(session.cwnd, 8); // 4 * 2
+
+        session.on_new_ack();
+        assert_eq!(session.cwnd, 16); // 8 * 2
+    }
+
+    #[test]
+    fn test_aimd_congestion_avoidance() {
+        let mut session = ReliableSession::new(1, 2, 100, 200, 8, 4);
+        // Force into congestion avoidance
+        session.ssthresh = 8;
+        session.cwnd = 8;
+
+        // Congestion avoidance: cwnd += 1 (additive increase)
+        session.on_new_ack();
+        assert_eq!(session.cwnd, 9);
+
+        session.on_new_ack();
+        assert_eq!(session.cwnd, 10);
+    }
+
+    #[test]
+    fn test_aimd_multiplicative_decrease() {
+        let mut session = ReliableSession::new(1, 2, 100, 200, 8, 64);
+        session.cwnd = 32;
+
+        // On loss: ssthresh = cwnd/2, cwnd = 1
+        session.on_loss();
+        assert_eq!(session.ssthresh, 16);
+        assert_eq!(session.cwnd, 1);
+    }
+
+    #[test]
+    fn test_rtt_estimation() {
+        let mut session = ReliableSession::new(1, 2, 100, 200, 8, 64);
+        // Initial: srtt=200, rttvar=100, rto=200 (clamped)
+
+        // Sample 1: 50ms
+        session.update_rtt(50.0);
+        // srtt = 0.875*200 + 0.125*50 = 175 + 6.25 = 181.25
+        let expected_srtt = 0.875 * 200.0 + 0.125 * 50.0;
+        assert!((session.srtt - expected_srtt).abs() < 0.01);
+
+        // RTO should be adaptive
+        let expected_rto = session.srtt + 4.0 * session.rttvar;
+        let clamped = expected_rto.round() as u64;
+        assert_eq!(session.rto, clamped.max(200).min(60000));
+    }
+
+    #[test]
+    fn test_rtt_karn_skip_retransmit() {
+        let mut session = make_session();
+        let mut frame = vec![0u8; 64];
+        frame[0..4].copy_from_slice(&0x5542_5543u32.to_be_bytes());
+        session.assign_seq(&mut frame, true, 0);
+
+        // Simulate retransmission by incrementing retry_count
+        session.retransmit_queue.front_mut().unwrap().retry_count = 1;
+
+        let initial_srtt = session.srtt;
+
+        // Process ACK for retransmitted frame — should NOT update RTT
+        let ack = AckPayload {
+            ack_seq: 1,
+            credit_grant: 1,
+            reserved: 0,
+            sack_bitmap: None,
+        };
+        session.process_ack(&ack);
+
+        // srtt should remain unchanged (Karn: skip retransmitted frame RTT samples)
+        assert_eq!(session.srtt, initial_srtt);
+    }
+
+    #[test]
+    fn test_sack_fast_retransmit() {
+        let mut session = make_session();
+
+        // First, set last_ack_seq by processing an initial ACK
+        session.last_ack_seq = 1;
+
+        // Simulate 3 duplicate ACKs with SACK
+        let mut bitmap = [0u8; 32];
+        bitmap[0] = 0b10; // seq=3 received
+
+        let ack = AckPayload {
+            ack_seq: 1, // Not advancing past last_ack_seq=1
+            credit_grant: 0,
+            reserved: 0,
+            sack_bitmap: Some(bitmap),
+        };
+
+        // First dup ACK — no retransmit
+        assert!(session.process_ack_for_fast_retransmit(&ack).is_none());
+        // Second dup ACK — no retransmit
+        assert!(session.process_ack_for_fast_retransmit(&ack).is_none());
+        // Third dup ACK — trigger fast retransmit
+        let result = session.process_ack_for_fast_retransmit(&ack);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), 2); // Retransmit seq=2 (ack_seq+1)
+    }
+
+    #[test]
+    fn test_send_available() {
+        let mut session = ReliableSession::new(1, 2, 100, 200, 8, 64);
+        // cwnd=64, no outstanding frames
+        assert_eq!(session.send_available(), 64);
+
+        // Add some outstanding frames
+        let mut frame = vec![0u8; 64];
+        frame[0..4].copy_from_slice(&0x5542_5543u32.to_be_bytes());
+        session.assign_seq(&mut frame, false, 0);
+        session.assign_seq(&mut frame, false, 1);
+        session.assign_seq(&mut frame, false, 2);
+
+        // 64 - 3 = 61
+        assert_eq!(session.send_available(), 61);
     }
 }

@@ -504,6 +504,24 @@ impl TransportManager {
 
             if let Some(session) = self.sessions.get(&session_key) {
                 let mut session = session.lock();
+
+                // Check for SACK fast retransmit before processing
+                if let Some(retransmit_seq) = session.process_ack_for_fast_retransmit(&ack) {
+                    // Fast retransmit: resend the unacked frame immediately
+                    if let Some(re_entry) = session.get_retransmit_entry(retransmit_seq) {
+                        let frame = re_entry.frame.clone();
+                        let rn = session.key.remote_node;
+                        drop(session);
+                        ub_obs::incr(ub_obs::RETRANS);
+                        self.send_frame_to_peer(rn, &frame);
+                        // Re-lock to process the ACK
+                        let session = self.sessions.get(&session_key).unwrap();
+                        let mut session = session.lock();
+                        session.process_ack(&ack);
+                        return;
+                    }
+                }
+
                 session.process_ack(&ack);
             }
         }

@@ -13,7 +13,7 @@ use ub_core::mr::{MrCacheTable, MrPublishEvent, MrTable};
 use ub_core::types::{NodeState, PeerChangeEvent};
 
 use crate::member::{MemberTable, NodeInfo};
-use crate::message::{ControlMsg, HelloPayload, HeartbeatPayload, MemberDownPayload, MrPublishPayload, MrRevokePayload};
+use crate::message::{ControlMsg, HelloPayload, HeartbeatPayload, JoinPayload, MemberDownPayload, MemberSnapshotPayload, MrPublishPayload, MrRevokePayload, SnapshotNodeInfo};
 
 /// Control plane engine.
 pub struct ControlPlane {
@@ -156,6 +156,38 @@ impl ControlPlane {
                                 }
                                 Err(e) => {
                                     tracing::warn!("control plane: connect to {} failed: {e}, retrying in {:?}", peer_str, delay);
+                                    tokio::time::sleep(delay).await;
+                                    delay = std::cmp::min(delay * 2, Duration::from_secs(30));
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        } else if self.config.control.bootstrap == "seed" {
+            // Seed mode: connect to seed nodes and send Join message
+            for seed_addr_str in &self.config.control.seed_addrs {
+                if let Ok(seed_addr) = seed_addr_str.parse::<SocketAddr>() {
+                    let members = Arc::clone(&self.members);
+                    let config = Arc::clone(&self.config);
+                    let local_epoch = self.local_epoch;
+                    let mr_cache = Arc::clone(&self.mr_cache);
+                    let mr_table = self.mr_table.clone();
+                    let peer_change_tx = self.peer_change_tx.clone();
+                    let seed_str = seed_addr_str.clone();
+                    tokio::spawn(async move {
+                        let mut delay = Duration::from_secs(1);
+                        loop {
+                            match TcpStream::connect(seed_addr).await {
+                                Ok(stream) => {
+                                    tracing::info!("control plane: connected to seed {}", seed_str);
+                                    handle_seed_join(
+                                        stream, members, config, local_epoch, mr_cache, mr_table, peer_change_tx,
+                                    ).await;
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!("control plane: connect to seed {} failed: {e}, retrying in {:?}", seed_str, delay);
                                     tokio::time::sleep(delay).await;
                                     delay = std::cmp::min(delay * 2, Duration::from_secs(30));
                                 }
@@ -419,6 +451,98 @@ async fn handle_peer_connection(
     write_handle.abort();
 }
 
+/// Handle a seed connection: send Join message, then run normal peer connection loop.
+async fn handle_seed_join(
+    stream: TcpStream,
+    members: Arc<MemberTable>,
+    config: Arc<NodeConfig>,
+    local_epoch: u32,
+    mr_cache: Arc<MrCacheTable>,
+    mr_table: Option<Arc<MrTable>>,
+    peer_change_tx: watch::Sender<PeerChangeEvent>,
+) {
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(read_half);
+
+    // Create channel for sending messages to this peer
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+
+    // Send JOIN message
+    let join = ControlMsg::Join(JoinPayload {
+        node_id: config.node_id,
+        epoch: local_epoch,
+        data_addr: config.data.listen.clone(),
+        control_addr: config.control.listen.clone(),
+        initial_credits: config.flow.initial_credits,
+    });
+    let join_bytes = join.encode();
+    if let Err(e) = write_half.write_all(&join_bytes).await {
+        tracing::error!("failed to send JOIN: {e}");
+        return;
+    }
+
+    // Read loop
+    let members_read = Arc::clone(&members);
+    let mr_cache_read = Arc::clone(&mr_cache);
+    let config_read = Arc::clone(&config);
+    let tx_clone = tx.clone();
+    let local_epoch_read = local_epoch;
+    let mr_table_read = mr_table.clone();
+    let peer_change_tx_read = peer_change_tx.clone();
+
+    let read_handle = tokio::spawn(async move {
+        let mut len_buf = [0u8; 4];
+        loop {
+            if let Err(e) = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut len_buf).await {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    tracing::warn!("control read error: {e}");
+                }
+                break;
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+            if len > 1_000_000 {
+                tracing::error!("control message too large: {len}");
+                break;
+            }
+
+            let mut msg_buf = vec![0u8; 1 + len];
+            if let Err(e) = tokio::io::AsyncReadExt::read_exact(&mut reader, &mut msg_buf).await {
+                tracing::warn!("control read error: {e}");
+                break;
+            }
+
+            let mut full_msg = Vec::with_capacity(5 + len);
+            full_msg.extend_from_slice(&len_buf);
+            full_msg.extend_from_slice(&msg_buf);
+
+            match ControlMsg::decode(&full_msg) {
+                Ok(msg) => {
+                    process_control_message(
+                        msg, &members_read, &config_read, &mr_cache_read, &mr_table_read,
+                        &tx_clone, local_epoch_read, &peer_change_tx_read,
+                    ).await;
+                }
+                Err(e) => {
+                    tracing::warn!("failed to decode control message: {e}");
+                }
+            }
+        }
+    });
+
+    // Write loop
+    let write_handle = tokio::spawn(async move {
+        while let Some(data) = rx.recv().await {
+            if let Err(e) = write_half.write_all(&data).await {
+                tracing::warn!("control write error: {e}");
+                break;
+            }
+        }
+    });
+
+    let _ = read_handle.await;
+    write_handle.abort();
+}
+
 /// Process a received control message.
 #[tracing::instrument(skip(msg, members, config, mr_cache, mr_table, peer_tx, peer_change_tx), fields(local_epoch = local_epoch))]
 async fn process_control_message(
@@ -537,6 +661,91 @@ async fn process_control_message(
         ControlMsg::MrRevoke(revoke) => {
             tracing::info!("MR_REVOKE: node={} handle={}", revoke.owner_node, revoke.mr_handle);
             mr_cache.remove(revoke.owner_node, revoke.mr_handle);
+        }
+        ControlMsg::Join(join) => {
+            tracing::info!(
+                "JOIN from node {} epoch {} data_addr={} control_addr={}",
+                join.node_id, join.epoch, join.data_addr, join.control_addr
+            );
+            // Register the joining node
+            let info = NodeInfo {
+                node_id: join.node_id,
+                state: NodeState::Active,
+                control_addr: join.control_addr.clone(),
+                data_addr: join.data_addr.clone(),
+                epoch: join.epoch,
+                initial_credits: join.initial_credits,
+                last_seen: Some(now_millis()),
+                tx: Some(peer_tx.clone()),
+            };
+            members.upsert(info);
+
+            // Reply with MemberSnapshot of all known nodes
+            let all_nodes = members.list();
+            let snapshot_nodes: Vec<SnapshotNodeInfo> = all_nodes.iter().map(|n| {
+                let state_byte = match n.state {
+                    NodeState::Joining => 0u8,
+                    NodeState::Active => 1u8,
+                    NodeState::Suspect => 2u8,
+                    NodeState::Leaving => 3u8,
+                    NodeState::Down => 4u8,
+                };
+                SnapshotNodeInfo {
+                    node_id: n.node_id,
+                    state: state_byte,
+                    data_addr: n.data_addr.clone(),
+                    control_addr: n.control_addr.clone(),
+                    epoch: n.epoch,
+                }
+            }).collect();
+
+            let snapshot = ControlMsg::MemberSnapshot(MemberSnapshotPayload {
+                nodes: snapshot_nodes,
+            });
+            let encoded = snapshot.encode();
+            let _ = peer_tx.send(encoded.to_vec()).await;
+
+            // Send existing MRs to the new peer
+            send_existing_mrs(mr_table, peer_tx).await;
+
+            // Notify data plane about new peer
+            let _ = peer_change_tx.send(PeerChangeEvent::Joined {
+                node_id: join.node_id,
+                epoch: join.epoch,
+            });
+        }
+        ControlMsg::MemberSnapshot(snapshot) => {
+            tracing::info!("MEMBER_SNAPSHOT: {} nodes", snapshot.nodes.len());
+            for node in &snapshot.nodes {
+                let node_state = match node.state {
+                    0 => NodeState::Joining,
+                    1 => NodeState::Active,
+                    2 => NodeState::Suspect,
+                    3 => NodeState::Leaving,
+                    _ => NodeState::Down,
+                };
+                // Don't overwrite self
+                if node.node_id == config.node_id {
+                    continue;
+                }
+                let info = NodeInfo {
+                    node_id: node.node_id,
+                    state: node_state,
+                    control_addr: node.control_addr.clone(),
+                    data_addr: node.data_addr.clone(),
+                    epoch: node.epoch,
+                    initial_credits: 0,
+                    last_seen: Some(now_millis()),
+                    tx: None, // No direct connection yet
+                };
+                members.upsert(info);
+
+                // Notify data plane about the peer
+                let _ = peer_change_tx.send(PeerChangeEvent::Joined {
+                    node_id: node.node_id,
+                    epoch: node.epoch,
+                });
+            }
         }
         _ => {
             tracing::warn!("unhandled control message type");

@@ -579,7 +579,13 @@ fn handle_write(
         }
     };
 
+    if !entry.try_inflight_inc() {
+        tracing::warn!("WRITE: MR {} is being deregistered", ext.mr_handle);
+        return;
+    }
+
     if let Err(e) = entry.check_perms(Verb::Write) {
+        entry.inflight_dec();
         tracing::warn!("WRITE: permission denied for MR {}: {e}", ext.mr_handle);
         return;
     }
@@ -594,6 +600,7 @@ fn handle_write(
     if let Err(e) = entry.device.write(device_offset, payload) {
         tracing::warn!("WRITE: device write error: {e}");
     }
+    entry.inflight_dec();
 }
 
 async fn handle_read_req(
@@ -615,7 +622,13 @@ async fn handle_read_req(
         }
     };
 
+    if !entry.try_inflight_inc() {
+        send_error_response(transport, local_node_id, header.src_node, ext, 1);
+        return;
+    }
+
     if entry.check_perms(Verb::ReadReq).is_err() {
+        entry.inflight_dec();
         send_error_response(transport, local_node_id, header.src_node, ext, 2);
         return;
     }
@@ -654,6 +667,7 @@ async fn handle_read_req(
             send_error_response(transport, local_node_id, header.src_node, ext, 1);
         }
     }
+    entry.inflight_dec();
 }
 
 async fn handle_atomic_cas(
@@ -674,7 +688,13 @@ async fn handle_atomic_cas(
         }
     };
 
+    if !entry.try_inflight_inc() {
+        send_error_response(transport, local_node_id, header.src_node, ext, 1);
+        return;
+    }
+
     if entry.check_perms(Verb::AtomicCas).is_err() {
+        entry.inflight_dec();
         send_error_response(transport, local_node_id, header.src_node, ext, 2);
         return;
     }
@@ -685,6 +705,7 @@ async fn handle_atomic_cas(
         0
     };
     if offset_in_mr % 8 != 0 {
+        entry.inflight_dec();
         send_error_response(transport, local_node_id, header.src_node, ext, 3);
         return;
     }
@@ -692,6 +713,7 @@ async fn handle_atomic_cas(
     let device_offset = entry.base_offset + offset_in_mr;
 
     if payload.len() < 16 {
+        entry.inflight_dec();
         send_error_response(transport, local_node_id, header.src_node, ext, 9);
         return;
     }
@@ -723,6 +745,7 @@ async fn handle_atomic_cas(
             send_error_response(transport, local_node_id, header.src_node, ext, 9);
         }
     }
+    entry.inflight_dec();
 }
 
 async fn handle_atomic_faa(
@@ -743,7 +766,13 @@ async fn handle_atomic_faa(
         }
     };
 
+    if !entry.try_inflight_inc() {
+        send_error_response(transport, local_node_id, header.src_node, ext, 1);
+        return;
+    }
+
     if entry.check_perms(Verb::AtomicFaa).is_err() {
+        entry.inflight_dec();
         send_error_response(transport, local_node_id, header.src_node, ext, 2);
         return;
     }
@@ -754,6 +783,7 @@ async fn handle_atomic_faa(
         0
     };
     if offset_in_mr % 8 != 0 {
+        entry.inflight_dec();
         send_error_response(transport, local_node_id, header.src_node, ext, 3);
         return;
     }
@@ -761,6 +791,7 @@ async fn handle_atomic_faa(
     let device_offset = entry.base_offset + offset_in_mr;
 
     if payload.len() < 8 {
+        entry.inflight_dec();
         send_error_response(transport, local_node_id, header.src_node, ext, 9);
         return;
     }
@@ -791,6 +822,7 @@ async fn handle_atomic_faa(
             send_error_response(transport, local_node_id, header.src_node, ext, 9);
         }
     }
+    entry.inflight_dec();
 }
 
 fn complete_pending_request(
@@ -878,7 +910,13 @@ fn handle_write_imm(
         }
     };
 
+    if !entry.try_inflight_inc() {
+        tracing::warn!("WRITE_IMM: MR {} is being deregistered", ext.mr_handle);
+        return;
+    }
+
     if let Err(e) = entry.check_perms(Verb::WriteImm) {
+        entry.inflight_dec();
         tracing::warn!("WRITE_IMM: permission denied for MR {}: {e}", ext.mr_handle);
         return;
     }
@@ -891,6 +929,7 @@ fn handle_write_imm(
     let device_offset = entry.base_offset + offset_in_mr;
 
     if let Err(e) = entry.device.write(device_offset, payload) {
+        entry.inflight_dec();
         tracing::warn!("WRITE_IMM: device write error: {e}");
         return;
     }
@@ -899,6 +938,7 @@ fn handle_write_imm(
     let jetty = match jetty_table.lookup(ext.jetty_dst) {
         Some(j) => j,
         None => {
+            entry.inflight_dec();
             tracing::warn!("WRITE_IMM: jetty {} not found, write completed but no CQE", ext.jetty_dst);
             return;
         }
@@ -918,6 +958,7 @@ fn handle_write_imm(
     } else {
         ub_obs::incr(ub_obs::CQE_OK);
     }
+    entry.inflight_dec();
 }
 
 fn send_error_response(

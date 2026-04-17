@@ -201,6 +201,8 @@ pub struct JettyTable {
     next_handle: std::sync::atomic::AtomicU32,
     node_id: u16,
     config: JettyConfig,
+    /// The first Jetty created becomes the default Jetty.
+    default_jetty: std::sync::atomic::AtomicU32,
 }
 
 impl JettyTable {
@@ -210,17 +212,44 @@ impl JettyTable {
             next_handle: std::sync::atomic::AtomicU32::new(1),
             node_id,
             config,
+            default_jetty: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
     /// Create a new Jetty and register it in the table.
+    /// The first Jetty created becomes the default Jetty.
     /// Returns the JettyHandle.
     pub fn create(&self) -> Result<JettyHandle, UbError> {
         let handle_val = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let handle = JettyHandle(handle_val);
         let jetty = Arc::new(Jetty::new(handle, self.node_id, &self.config));
         self.entries.insert(handle_val, jetty);
+
+        // Set as default if this is the first Jetty
+        self.default_jetty.compare_exchange(
+            0,
+            handle_val,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        ).ok(); // Ignore result — if already set, that's fine
+
         Ok(handle)
+    }
+
+    /// Get the default Jetty handle (the first Jetty created).
+    /// Returns None if no Jetty has been created or the default was deregistered.
+    pub fn default_jetty(&self) -> Option<JettyHandle> {
+        let h = self.default_jetty.load(std::sync::atomic::Ordering::Acquire);
+        if h == 0 {
+            None
+        } else {
+            // Verify the Jetty still exists
+            if self.entries.contains_key(&h) {
+                Some(JettyHandle(h))
+            } else {
+                None
+            }
+        }
     }
 
     /// Look up a Jetty by handle.
@@ -229,8 +258,16 @@ impl JettyTable {
     }
 
     /// Deregister (close) a Jetty by handle.
+    /// If this was the default Jetty, clears the default.
     pub fn deregister(&self, handle: u32) -> Result<(), UbError> {
         if let Some((_, jetty)) = self.entries.remove(&handle) {
+            // Clear default if this was it
+            self.default_jetty.compare_exchange(
+                handle,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ).ok();
             jetty.close();
             Ok(())
         } else {
@@ -582,5 +619,49 @@ mod tests {
             mr_handle: None,
         };
         assert!(jetty.post_send(wr2).is_ok());
+    }
+
+    #[test]
+    fn test_default_jetty_first_create() {
+        let config = default_config();
+        let table = JettyTable::new(1, config);
+
+        // No default yet
+        assert!(table.default_jetty().is_none());
+
+        let h1 = table.create().unwrap();
+        // First Jetty becomes default
+        assert_eq!(table.default_jetty(), Some(h1));
+
+        let h2 = table.create().unwrap();
+        // Second create does NOT change default
+        assert_eq!(table.default_jetty(), Some(h1));
+        assert_ne!(h1.0, h2.0);
+    }
+
+    #[test]
+    fn test_default_jetty_not_changed_on_second_create() {
+        let config = default_config();
+        let table = JettyTable::new(1, config);
+        let h1 = table.create().unwrap();
+        let _h2 = table.create().unwrap();
+        let _h3 = table.create().unwrap();
+        assert_eq!(table.default_jetty(), Some(h1));
+    }
+
+    #[test]
+    fn test_default_jetty_close_clears() {
+        let config = default_config();
+        let table = JettyTable::new(1, config);
+        let h1 = table.create().unwrap();
+        assert_eq!(table.default_jetty(), Some(h1));
+
+        table.deregister(h1.0).unwrap();
+        // Default cleared since h1 was removed
+        assert!(table.default_jetty().is_none());
+
+        // Creating another after default was cleared makes it the new default
+        let h2 = table.create().unwrap();
+        assert_eq!(table.default_jetty(), Some(h2));
     }
 }

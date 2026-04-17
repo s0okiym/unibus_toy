@@ -15,6 +15,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start a new unibusd node process
+    NodeStart {
+        /// Path to the node configuration YAML file
+        #[arg(long)]
+        config: String,
+    },
     /// List all nodes in the SuperPod
     NodeList,
     /// Show info about a specific node
@@ -56,6 +62,9 @@ enum Commands {
         /// Number of KV slots
         #[arg(short, long, default_value = "16")]
         slots: u32,
+        /// Device kind: "memory" or "npu"
+        #[arg(long, default_value = "memory")]
+        device_kind: String,
     },
     /// Put a key-value pair into a KV slot
     KvPut {
@@ -67,6 +76,12 @@ enum Commands {
         key: String,
         /// Value string
         value: String,
+        /// Replica node ID for write_with_imm notification
+        #[arg(long)]
+        replica_node_id: Option<u16>,
+        /// Replica jetty ID for notification
+        #[arg(long)]
+        replica_jetty_id: Option<u32>,
     },
     /// Get a value from a KV slot
     KvGet {
@@ -89,6 +104,12 @@ enum Commands {
         expect_version: u64,
         /// New value string
         value: String,
+        /// Replica node ID for write_with_imm notification on success
+        #[arg(long)]
+        replica_node_id: Option<u16>,
+        /// Replica jetty ID for notification
+        #[arg(long)]
+        replica_jetty_id: Option<u32>,
     },
 }
 
@@ -98,6 +119,23 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
 
     match cli.command {
+        Commands::NodeStart { config } => {
+            // Spawn unibusd as a child process
+            let child = std::process::Command::new("unibusd")
+                .args(["--config", &config])
+                .spawn();
+
+            match child {
+                Ok(child) => {
+                    let pid = child.id();
+                    println!("unibusd started: PID={pid}, config={config}");
+                }
+                Err(e) => {
+                    eprintln!("Failed to start unibusd: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Commands::NodeList => {
             let url = format!("{}/admin/node/list", cli.addr);
             let resp = client.get(&url).send().await?;
@@ -321,10 +359,10 @@ async fn main() -> anyhow::Result<()> {
             }
             print_stats("atomic_faa", &faa_latencies, ok_count, err_count, 8);
         }
-        Commands::KvInit { slots } => {
+        Commands::KvInit { slots, device_kind } => {
             let url = format!("{}/admin/kv/init", cli.addr);
             let resp = client.post(&url)
-                .json(&serde_json::json!({"slots": slots}))
+                .json(&serde_json::json!({"slots": slots, "device_kind": device_kind}))
                 .send().await?;
             let body: serde_json::Value = resp.json().await?;
             if body.get("status").is_some() {
@@ -338,10 +376,17 @@ async fn main() -> anyhow::Result<()> {
                 println!("{body}");
             }
         }
-        Commands::KvPut { ub_addr, slot, key, value } => {
+        Commands::KvPut { ub_addr, slot, key, value, replica_node_id, replica_jetty_id } => {
             let url = format!("{}/admin/kv/put", cli.addr);
+            let mut body = serde_json::json!({"ub_addr": ub_addr, "slot": slot, "key": key, "value": value});
+            if let Some(node_id) = replica_node_id {
+                body["replica_node_id"] = serde_json::json!(node_id);
+            }
+            if let Some(jetty_id) = replica_jetty_id {
+                body["replica_jetty_id"] = serde_json::json!(jetty_id);
+            }
             let resp = client.post(&url)
-                .json(&serde_json::json!({"ub_addr": ub_addr, "slot": slot, "key": key, "value": value}))
+                .json(&body)
                 .send().await?;
             let body: serde_json::Value = resp.json().await?;
             if body.get("status").is_some() {
@@ -370,10 +415,17 @@ async fn main() -> anyhow::Result<()> {
                 println!("{body}");
             }
         }
-        Commands::KvCas { ub_addr, slot, key, expect_version, value } => {
+        Commands::KvCas { ub_addr, slot, key, expect_version, value, replica_node_id, replica_jetty_id } => {
             let url = format!("{}/admin/kv/cas", cli.addr);
+            let mut body = serde_json::json!({"ub_addr": ub_addr, "slot": slot, "key": key, "expect_version": expect_version, "value": value});
+            if let Some(node_id) = replica_node_id {
+                body["replica_node_id"] = serde_json::json!(node_id);
+            }
+            if let Some(jetty_id) = replica_jetty_id {
+                body["replica_jetty_id"] = serde_json::json!(jetty_id);
+            }
             let resp = client.post(&url)
-                .json(&serde_json::json!({"ub_addr": ub_addr, "slot": slot, "key": key, "expect_version": expect_version, "value": value}))
+                .json(&body)
                 .send().await?;
             let body: serde_json::Value = resp.json().await?;
             if body.get("status").and_then(|v| v.as_str()) == Some("ok") {
