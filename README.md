@@ -920,6 +920,7 @@ managed:
 | 文档 | 说明 |
 |---|---|
 | [REQUIREMENTS.md](./docs/REQUIREMENTS.md) | 项目需求文档：项目背景、目标、术语表、用户故事、13 类功能需求（FR-ADDR ~ FR-DEV，共 65 项）、验收标准 |
+| [DEPLOYMENT_GUIDE.md](./docs/DEPLOYMENT_GUIDE.md) | 部署与配置指南：环境准备、编译构建、全部配置项详解（类型/默认值/含义/约束）、Verbs 层和 Managed 层集群部署步骤、unibusctl CLI 参考、Admin HTTP API 参考、E2E 测试、端口分配、性能调优、故障排查 |
 | [DESIGN.md](./docs/DESIGN.md) | 详细设计文档：Part I Verbs 层（§1–§12，架构/线协议/传输/流控/控制面/Jetty/Verbs API/错误/Fabric）；Part II Managed 层（§13–§18，动机/概念/API/机制/一致性）；Part III 共享交付物（§19–§23，验收/性能/里程碑/评审） |
 | [DETAIL_DESIGN.md](./docs/DETAIL_DESIGN.md) | 早期版详细设计：目录式总览，覆盖架构/编址/线协议/传输/流控/控制面/Jetty/Fabric/可观测/错误/配置/Managed 层/Demo/测试/里程碑，部分细节与 DESIGN.md 有差异以 DESIGN.md 为准 |
 | [IMPL_PLAN.md](./docs/IMPL_PLAN.md) | 总体实施计划：6 个里程碑（M1–M5, M7）拆分为 27 个增量步骤；原则：先骨架后填充、先单节点后分布式、先快乐路径后错误处理、先功能后性能；含 Cargo workspace 依赖图和 crate 构建顺序 |
